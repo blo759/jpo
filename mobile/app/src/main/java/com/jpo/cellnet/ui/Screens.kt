@@ -84,6 +84,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.jpo.cellnet.call.CallPhase
+import com.jpo.cellnet.call.CallSessionPolicy
 import com.jpo.cellnet.data.CallEntity
 import com.jpo.cellnet.data.CallRecordState
 import com.jpo.cellnet.data.ConversationEntity
@@ -830,9 +831,11 @@ private fun ChatScreen(
         }
     }
 
-    // A live call is possible only between two users of the same cell: the
-    // button is disabled (with the reason in the subtitle) otherwise.
+    // A live call is possible between any two cells of the deployment: the
+    // station routes a cross cell call over the Wi-Fi backbone.
     val callAllowed = state.cellSite != null && state.httpConnected && state.wsConnected
+    val peerStation = state.users.firstOrNull { it.id == state.activePeer }?.station
+    val crossCell = CallSessionPolicy.isCrossCell(state.cellSite, peerStation)
 
     Scaffold(
         topBar = {
@@ -851,7 +854,11 @@ private fun ChatScreen(
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            state.cellSite?.let { "Vous êtes sur $it" } ?: "Hors cellule",
+                            when {
+                                state.cellSite == null -> "Hors cellule"
+                                crossCell -> "Vous êtes sur $state.cellSite · appel vers $peerStation"
+                                else -> "Vous êtes sur ${state.cellSite}"
+                            },
                             style = MaterialTheme.typography.labelSmall
                         )
                     }
@@ -1182,8 +1189,8 @@ private fun CallHistoryRow(call: CallEntity) {
 
 /** Status line shown on the call screen. */
 private fun callStatusLabel(call: CallUiState): String = when (call.phase) {
-    CallPhase.DIALING -> "Appel en cours…"
-    CallPhase.RINGING -> "Appel entrant"
+    CallPhase.DIALING -> call.detail ?: "Appel en cours…"
+    CallPhase.RINGING -> call.detail ?: "Appel entrant"
     CallPhase.ACTIVE -> "En communication"
     CallPhase.ENDED, CallPhase.IDLE -> call.detail ?: ""
 }
@@ -1236,7 +1243,8 @@ private fun CallOverlay(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
-                "Appel local à la cellule uniquement",
+                call.remoteCell?.let { "Appel inter-cellules · Wi-Fi CellNet · vers $it" }
+                    ?: "Appel local à la cellule · Wi-Fi CellNet",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

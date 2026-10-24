@@ -15,14 +15,19 @@ import org.junit.Test
  */
 class CallSessionPolicyTest {
 
+    private val deployment = setOf("SITE_A", "SITE_B", "SITE_C")
+
     private fun canStart(
         peerId: String = "u-2",
         peerStation: String? = "SITE_A",
         localCell: String? = "SITE_A",
         selfId: String = "u-1",
         phase: CallPhase = CallPhase.IDLE,
-        connected: Boolean = true
-    ) = CallSessionPolicy.canStart(phase, localCell, peerStation, peerId, selfId, connected)
+        connected: Boolean = true,
+        knownCells: Set<String> = deployment
+    ) = CallSessionPolicy.canStart(
+        phase, localCell, peerStation, peerId, selfId, connected, knownCells
+    )
 
     // -----------------------------------------------------------------------
     // Allowed: both users on the same cell
@@ -60,61 +65,88 @@ class CallSessionPolicyTest {
     }
 
     // -----------------------------------------------------------------------
-    // Forbidden: the two users are not on the same cell
+    // Allowed: the two users are on different cells of the deployment
     // -----------------------------------------------------------------------
     @Test
-    fun callFromSiteAToSiteBIsRefused() {
+    fun callFromSiteAToSiteBIsAllowed() {
         assertEquals(
-            CallRefusal.CROSS_CELL,
+            CallRefusal.NONE,
             canStart(peerId = "u-b1", peerStation = "SITE_B", localCell = "SITE_A", selfId = "u-a1")
         )
     }
 
     @Test
-    fun callFromSiteAToSiteCIsRefused() {
+    fun callFromSiteAToSiteCIsAllowed() {
         assertEquals(
-            CallRefusal.CROSS_CELL,
+            CallRefusal.NONE,
             canStart(peerId = "u-c1", peerStation = "SITE_C", localCell = "SITE_A", selfId = "u-a1")
         )
     }
 
     @Test
-    fun callFromSiteBToSiteAIsRefused() {
+    fun callFromSiteBToSiteAIsAllowed() {
         assertEquals(
-            CallRefusal.CROSS_CELL,
+            CallRefusal.NONE,
             canStart(peerId = "u-a1", peerStation = "SITE_A", localCell = "SITE_B", selfId = "u-b1")
         )
     }
 
     @Test
-    fun callFromSiteBToSiteCIsRefused() {
+    fun callFromSiteBToSiteCIsAllowed() {
         assertEquals(
-            CallRefusal.CROSS_CELL,
+            CallRefusal.NONE,
             canStart(peerId = "u-c1", peerStation = "SITE_C", localCell = "SITE_B", selfId = "u-b1")
         )
     }
 
     @Test
-    fun callFromSiteCToSiteAIsRefused() {
+    fun callFromSiteCToSiteAIsAllowed() {
         assertEquals(
-            CallRefusal.CROSS_CELL,
+            CallRefusal.NONE,
             canStart(peerId = "u-a1", peerStation = "SITE_A", localCell = "SITE_C", selfId = "u-c1")
         )
     }
 
     @Test
-    fun callFromSiteCToSiteBIsRefused() {
+    fun callFromSiteCToSiteBIsAllowed() {
         assertEquals(
-            CallRefusal.CROSS_CELL,
+            CallRefusal.NONE,
             canStart(peerId = "u-b1", peerStation = "SITE_B", localCell = "SITE_C", selfId = "u-c1")
         )
     }
 
     @Test
-    fun theRefusalMessageExplainsTheCellularRestriction() {
-        val message = CallSessionPolicy.refusalMessage(CallRefusal.CROSS_CELL)
-        assertTrue(message.contains("cellule"))
-        assertFalse(message.isBlank())
+    fun everyOrderedPairOfTheThreeCellsIsAllowed() {
+        val cells = listOf("SITE_A", "SITE_B", "SITE_C")
+        for (local in cells) {
+            for (peer in cells) {
+                assertEquals(
+                    "call $local -> $peer",
+                    CallRefusal.NONE,
+                    canStart(peerId = "u-$peer", peerStation = peer, localCell = local)
+                )
+            }
+        }
+    }
+
+    @Test
+    fun aPeerOnAStationOutsideTheDeploymentIsRefused() {
+        assertEquals(
+            CallRefusal.UNKNOWN_CELL,
+            canStart(peerId = "u-x1", peerStation = "SITE_D", localCell = "SITE_A")
+        )
+        assertTrue(CallSessionPolicy.refusalMessage(CallRefusal.UNKNOWN_CELL).isNotBlank())
+    }
+
+    @Test
+    fun theCrossCellFlagMatchesTheCells() {
+        assertTrue(CallSessionPolicy.isCrossCell("SITE_A", "SITE_B"))
+        assertTrue(CallSessionPolicy.isCrossCell("SITE_C", "SITE_A"))
+        assertFalse(CallSessionPolicy.isCrossCell("SITE_A", "SITE_A"))
+        assertFalse(CallSessionPolicy.isCrossCell("site_b", "SITE_B"))
+        // Without a known local cell, nothing is a cross cell call.
+        assertFalse(CallSessionPolicy.isCrossCell(null, "SITE_B"))
+        assertFalse(CallSessionPolicy.isCrossCell("SITE_A", null))
     }
 
     // -----------------------------------------------------------------------

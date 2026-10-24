@@ -30,6 +30,10 @@ namespace cell {
 constexpr size_t kMaxCallSessions = 4;
 constexpr size_t kCallIdLength = 8;     // ASCII alphanumeric, no terminator in the field
 constexpr size_t kCallUserLength = 24;  // same bound as the routing table user ids
+// Number of stations of the deployment. Declared here on purpose: the call
+// module must not depend on the bus protocol headers, so it cannot borrow the
+// node count from cell_protocol.h.
+constexpr uint8_t kCallMaxNodes = 3;
 
 // An unanswered invitation is forgotten after this delay.
 constexpr uint32_t kCallRingTimeoutMs = 30000;
@@ -103,6 +107,15 @@ struct CallSession {
   uint32_t ringingSinceMs = 0;
   uint32_t answeredAtMs = 0;
   uint32_t lastMediaMs = 0;
+  // Station hosting the participant that is NOT on this station. 0 means both
+  // participants are local (the original, purely local call path). When it is
+  // set, the signalling and the audio of this session travel over the Wi-Fi
+  // backbone (lib/cell_link), never over the RS485 bus.
+  uint8_t remoteNode = 0;
+  // Outgoing remote invitation: true once the remote station confirmed that the
+  // callee is really ringing. An invitation is never reported as ringing before
+  // that confirmation.
+  bool remoteConfirmed = false;
 };
 
 // Bounded, statically allocated call session table.
@@ -114,41 +127,65 @@ class CallTable {
   // client is never enough, and a user of another cell has no local socket.
   using LocalUserProbe = bool (*)(void* context, const char* userId);
 
-  void begin(LocalUserProbe probe, void* context);
+  void begin(LocalUserProbe probe, void* context, uint8_t selfNode);
 
-  // Signalling transitions. All of them validate the caller/callee pair against
-  // the local probe before touching the table.
+  // -------------------------------------------------------------------------
+  // Local calls: both participants hold a socket on this station. Unchanged
+  // behaviour, and the only path used when the two users are in the same cell.
+  // -------------------------------------------------------------------------
+  // All of them validate the caller/callee pair against the local probe before
+  // touching the table.
   CallStatus invite(const char* callId, const char* caller, const char* callee, uint32_t nowMs);
+
+  // -------------------------------------------------------------------------
+  // Cross cell calls. The participant that is not on this station is reachable
+  // through the Wi-Fi backbone, so only the local participant is probed: the
+  // remote one is validated by its own station when the signal arrives.
+  // -------------------------------------------------------------------------
+  // Outgoing: `caller` is local, `callee` lives on `remoteNode`.
+  CallStatus inviteRemote(const char* callId,
+                          const char* caller,
+                          const char* callee,
+                          uint8_t remoteNode,
+                          uint32_t nowMs);
+  // Incoming: `remoteCaller` lives on `remoteNode`, `localCallee` is here.
+  CallStatus inviteIncoming(const char* callId,
+                            const char* remoteCaller,
+                            const char* localCallee,
+                            uint8_t remoteNode,
+                            uint32_t nowMs);
+  // The remote station confirmed that the callee is ringing.
+  CallStatus noteRemoteRinging(const char* callId, uint32_t nowMs);
+  // The remote callee accepted the invitation.
+  CallStatus acceptRemote(const char* callId, uint32_t nowMs);
+  // The remote side refused, cancelled or ended the call.
+  CallStatus remoteEnd(const char* callId, uint32_t nowMs);
+
+  /** Station hosting the remote participant, or 0 when both are local. */
+  uint8_t remoteNodeOf(const char* callId) const;
+  bool isRemote(const char* callId) const;
   CallStatus accept(const char* callId, const char* userId, uint32_t nowMs);
   CallStatus reject(const char* callId, const char* userId, uint32_t nowMs);
   CallStatus cancel(const char* callId, const char* userId, uint32_t nowMs);
   CallStatus hangup(const char* callId, const char* userId, uint32_t nowMs);
 
   // Ends the session a user takes part in (socket closed, presence lost).
-  // `peerOut` and `callIdOut` receive what the station needs to notify the other
-  // party, so resources are never leaked on a disconnection.
+  // `endedOut` receives the released session, so the station knows the call id,
+  // the peer and whether the other participant lives on another station, and can
+  // notify everybody without keeping a second copy.
   CallStatus endForUser(const char* userId,
                         CallEndReason reason,
                         uint32_t nowMs,
-                        char* peerOut,
-                        size_t peerCapacity,
-                        char* callIdOut,
-                        size_t callIdCapacity);
+                        CallSession& endedOut);
 
   // Expires at most one ringing session (call it from loop()). Returns true and
-  // fills callIdOut when a session was dropped.
-  bool expireRinging(uint32_t nowMs, char* callIdOut, size_t callIdCapacity);
+  // fills `expiredOut` when a session was dropped.
+  bool expireRinging(uint32_t nowMs, CallSession& expiredOut);
 
   // Expires at most one established session that stopped carrying media. Both
   // participants are reported so the station can notify them without keeping a
   // second copy of the session.
-  bool expireStaleMedia(uint32_t nowMs,
-                        char* callIdOut,
-                        size_t callIdCapacity,
-                        char* callerOut,
-                        size_t callerCapacity,
-                        char* calleeOut,
-                        size_t calleeCapacity);
+  bool expireStaleMedia(uint32_t nowMs, CallSession& expiredOut);
 
   // Records that a media frame really crossed this station.
   void noteMedia(const char* callId, uint32_t nowMs);
@@ -180,11 +217,22 @@ class CallTable {
   CallSession* allocate();
   void release(CallSession& session);
   void refuse(CallStatus status);
+  // Shared body of invite() / inviteRemote() / inviteIncoming().
+  CallStatus create(const char* callId,
+                    const char* caller,
+                    const char* callee,
+                    uint8_t remoteNode,
+                    bool probeCaller,
+                    bool probeCallee,
+                    uint32_t nowMs);
+  bool cooldownExceeded(const char* caller, uint32_t nowMs) const;
+  void stampInvite(const char* caller, uint32_t nowMs);
 
   CallSession sessions_[kMaxCallSessions];
   InviteStamp stamps_[kMaxCallSessions];
   LocalUserProbe probe_ = nullptr;
   void* probeContext_ = nullptr;
+  uint8_t selfNode_ = 0;
   uint32_t completed_ = 0;
   uint32_t refused_ = 0;
   const char* lastRefusal_ = "";

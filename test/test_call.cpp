@@ -93,7 +93,7 @@ void testCallInviteWithinSameCellIsAccepted() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
@@ -113,7 +113,7 @@ void testCallAcceptThenHangupCompletesTheCall() {
   addUser(cellB, "u-b1");
   addUser(cellB, "u-b2");
   cell::CallTable table;
-  table.begin(probeFake, &cellB);
+  table.begin(probeFake, &cellB, 2);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallB, "u-b1", "u-b2", 1000U)));
@@ -133,43 +133,250 @@ void testCallAcceptThenHangupCompletesTheCall() {
 }
 
 // ---------------------------------------------------------------------------
-// Cellular isolation
+// Cellular routing of a call
 // ---------------------------------------------------------------------------
-void testCallBetweenTwoCellsIsRefused() {
-  // A user connected to SITE_A tries to call a user connected to SITE_B: the
-  // callee has no socket on this station, so the probe answers false.
+void testCallToARecipientOfAnotherCellUsesTheBackbone() {
+  // The local call path (invite) is unchanged: it requires both participants to
+  // hold a socket on this station. A cross cell call goes through the remote
+  // entries of the table instead, which is what the station uses when the
+  // routing table places the recipient on another node.
   FakeCell cellA;
   addUser(cellA, "u-a1");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   const cell::CallStatus status = table.invite(kCallA, "u-a1", "u-b1", 1000U);
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kNotLocal), static_cast<int>(status));
-  TEST_ASSERT_EQUAL_STRING("cross-cell", cell::callStatusName(status));
+  TEST_ASSERT_EQUAL_STRING("not-local", cell::callStatusName(status));
   TEST_ASSERT_NULL(table.find(kCallA));
   TEST_ASSERT_EQUAL_UINT32(0U, static_cast<uint32_t>(table.activeSessions()));
   TEST_ASSERT_EQUAL_UINT32(1U, table.refusedCalls());
-  TEST_ASSERT_EQUAL_STRING("cross-cell", table.lastRefusal());
+  TEST_ASSERT_EQUAL_STRING("not-local", table.lastRefusal());
 }
 
-void testCallFromAUserOfAnotherCellIsRefused() {
-  // Even a locally known callee cannot be called by someone who is not
-  // connected to this station.
+void testRemoteInvitationIsAcceptedAndReportedAsRemote() {
+  // A1 (SITE_A) calls B1 (SITE_B): the session is created locally for A1 and
+  // knows that the other participant lives on node 2.
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-b1", 2U, 1000U)));
+  const cell::CallSession* session = table.find(kCallA);
+  TEST_ASSERT_NOT_NULL(session);
+  TEST_ASSERT_EQUAL_UINT8(2U, session->remoteNode);
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallState::kRinging),
+                    static_cast<int>(session->state));
+  // The remote station has not confirmed anything yet: the call must not be
+  // reported as ringing on the other side before that confirmation.
+  TEST_ASSERT_FALSE(session->remoteConfirmed);
+  TEST_ASSERT_TRUE(table.isRemote(kCallA));
+  TEST_ASSERT_EQUAL_UINT8(2U, table.remoteNodeOf(kCallA));
+  TEST_ASSERT_TRUE(table.isBusy("u-a1"));
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.noteRemoteRinging(kCallA, 1200U)));
+  TEST_ASSERT_TRUE(table.find(kCallA)->remoteConfirmed);
+}
+
+void testRemoteCallBecomesActiveOnlyWhenThePeerAccepts() {
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-c1", 3U, 1000U)));
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.noteRemoteRinging(kCallA, 1100U)));
+  // No media is relayed before the remote acceptance.
+  TEST_ASSERT_NULL(table.mediaPeer(kCallA, "u-a1"));
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.acceptRemote(kCallA, 1500U)));
+  const cell::CallSession* session = table.find(kCallA);
+  TEST_ASSERT_NOT_NULL(session);
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallState::kActive),
+                    static_cast<int>(session->state));
+  TEST_ASSERT_EQUAL_UINT32(1500U, session->answeredAtMs);
+  // Both directions are valid: the local participant and the remote one.
+  TEST_ASSERT_EQUAL_STRING("u-c1", table.mediaPeer(kCallA, "u-a1"));
+  TEST_ASSERT_EQUAL_STRING("u-a1", table.mediaPeer(kCallA, "u-c1"));
+  // A third party is never a participant of a cross cell session.
+  TEST_ASSERT_NULL(table.mediaPeer(kCallA, "u-c2"));
+}
+
+void testIncomingRemoteInvitationRingsTheLocalCallee() {
+  // SITE_B receives the invitation of A1 for B1: the caller is remote, the
+  // callee is here, and the local accept path is the unchanged one.
+  FakeCell cellB;
+  addUser(cellB, "u-b1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellB, 2);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.inviteIncoming(kCallA, "u-a1", "u-b1", 1U, 1000U)));
+  const cell::CallSession* session = table.find(kCallA);
+  TEST_ASSERT_NOT_NULL(session);
+  TEST_ASSERT_EQUAL_UINT8(1U, session->remoteNode);
+  TEST_ASSERT_EQUAL_STRING("u-a1", session->caller);
+  TEST_ASSERT_EQUAL_STRING("u-b1", session->callee);
+  TEST_ASSERT_TRUE(session->remoteConfirmed);
+  TEST_ASSERT_TRUE(table.isBusy("u-b1"));
+  // The remote caller is never probed here: only the local callee must exist.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.accept(kCallA, "u-b1", 1500U)));
+  TEST_ASSERT_EQUAL_STRING("u-a1", table.mediaPeer(kCallA, "u-b1"));
+}
+
+void testIncomingRemoteInvitationIsRefusedWhenTheCalleeIsAbsent() {
+  FakeCell cellB;
+  addUser(cellB, "u-b1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellB, 2);
+
+  // u-b2 is not connected to this station: the invitation cannot be delivered.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kNotLocal),
+                    static_cast<int>(table.inviteIncoming(kCallB, "u-a1", "u-b2", 1U, 1000U)));
+  TEST_ASSERT_NULL(table.find(kCallB));
+}
+
+void testRemoteEntriesRejectContradictoryNodes() {
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  // "remote on my own station" is a contradiction.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kInvalidState),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-a2", 1U, 1000U)));
+  // An incoming invitation without a remote station is meaningless.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kInvalidState),
+                    static_cast<int>(table.inviteIncoming(kCallA, "u-a1", "u-a2", 0U, 1000U)));
+  // A node outside the deployment is refused too.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kInvalidState),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-a2", 9U, 1000U)));
+  TEST_ASSERT_EQUAL_UINT32(0U, static_cast<uint32_t>(table.activeSessions()));
+}
+
+void testRemoteEndReleasesTheSession() {
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-b1", 2U, 1000U)));
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.acceptRemote(kCallA, 1500U)));
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.remoteEnd(kCallA, 5000U)));
+  TEST_ASSERT_NULL(table.find(kCallA));
+  TEST_ASSERT_FALSE(table.isBusy("u-a1"));
+  TEST_ASSERT_EQUAL_UINT32(1U, table.completedCalls());
+  // Ending a cross cell call that is already gone is not an error: the other
+  // side may have released it first.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.remoteEnd(kCallA, 6000U)));
+}
+
+void testRemoteInvitationExpiresWithItsRemoteNode() {
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-b1", 2U, 1000U)));
+  cell::CallSession expired;
+  TEST_ASSERT_FALSE(table.expireRinging(1000U + cell::kCallRingTimeoutMs, expired));
+  TEST_ASSERT_TRUE(table.expireRinging(1000U + cell::kCallRingTimeoutMs + 1U, expired));
+  TEST_ASSERT_EQUAL_STRING(kCallA, expired.callId);
+  // The station needs the remote node to tell the other cell to stop ringing.
+  TEST_ASSERT_EQUAL_UINT8(2U, expired.remoteNode);
+  TEST_ASSERT_NULL(table.find(kCallA));
+}
+
+void testRemoteDisconnectionReportsTheRemoteNode() {
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-b1", 2U, 1000U)));
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.acceptRemote(kCallA, 1500U)));
+
+  cell::CallSession ended;
+  TEST_ASSERT_EQUAL(
+      static_cast<int>(cell::CallStatus::kOk),
+      static_cast<int>(table.endForUser("u-a1", cell::CallEndReason::kDisconnected, 4000U,
+                                        ended)));
+  TEST_ASSERT_EQUAL_STRING(kCallA, ended.callId);
+  TEST_ASSERT_EQUAL_STRING("u-b1", ended.callee);
+  TEST_ASSERT_EQUAL_UINT8(2U, ended.remoteNode);
+  TEST_ASSERT_NULL(table.find(kCallA));
+}
+
+void testSimultaneousCrossCellCallsAreRefusedWhenAUserIsBusy() {
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-b1", 2U, 1000U)));
+  // The same local user cannot start a second cross cell call.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kBusy),
+                    static_cast<int>(table.inviteRemote(kCallB, "u-a1", "u-c1", 3U, 5000U)));
+  // Nor accept an incoming one while already busy.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kBusy),
+                    static_cast<int>(table.inviteIncoming(kCallC, "u-b1", "u-a1", 2U, 5000U)));
+  TEST_ASSERT_EQUAL_UINT32(1U, static_cast<uint32_t>(table.activeSessions()));
+}
+
+void testALocalCallIsStillPossibleWhileTheBackboneIsDown() {
+  // The local path never consults the backbone: a same-cell call works even when
+  // the inter-station link is unusable.
+  FakeCell cellA;
+  addUser(cellA, "u-a1");
+  addUser(cellA, "u-a2");
+  cell::CallTable table;
+  table.begin(probeFake, &cellA, 1);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
+                    static_cast<int>(table.accept(kCallA, "u-a2", 1200U)));
+  TEST_ASSERT_FALSE(table.isRemote(kCallA));
+  TEST_ASSERT_EQUAL_UINT8(0U, table.remoteNodeOf(kCallA));
+  TEST_ASSERT_EQUAL_STRING("u-a2", table.mediaPeer(kCallA, "u-a1"));
+  TEST_ASSERT_EQUAL_STRING("u-a1", table.mediaPeer(kCallA, "u-a2"));
+}
+
+void testCallFromAUserThatIsNotConnectedHereIsRefused() {
+  // Even a locally known callee cannot be called by someone who is not connected
+  // to this station: the caller is probed too.
   FakeCell cellC;
   addUser(cellC, "u-c1");
   cell::CallTable table;
-  table.begin(probeFake, &cellC);
+  table.begin(probeFake, &cellC, 3);
 
   const cell::CallStatus status = table.invite(kCallC, "u-b1", "u-c1", 1000U);
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kNotLocal), static_cast<int>(status));
   TEST_ASSERT_NULL(table.find(kCallC));
+  // A cross cell call is refused as well when the caller is not here.
+  TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kNotLocal),
+                    static_cast<int>(table.inviteRemote(kCallC, "u-b1", "u-a1", 1U, 4000U)));
 }
 
 void testCallToAnUnknownUserIsRefused() {
   FakeCell cellA;
   addUser(cellA, "u-a1");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kNotLocal),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-ghost", 1000U)));
@@ -187,7 +394,7 @@ void testCallToSelfIsRefused() {
   FakeCell cellA;
   addUser(cellA, "u-a1");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kSelfCall),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a1", 1000U)));
@@ -203,7 +410,7 @@ void testBusyUserCannotReceiveASecondIncompatibleSession() {
   addUser(cellA, "u-a2");
   addUser(cellA, "u-a3");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
@@ -223,7 +430,7 @@ void testCallerCannotAcceptItsOwnInvitation() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
@@ -240,7 +447,7 @@ void testAcceptRequiresARingingSession() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kUnknownCall),
                     static_cast<int>(table.accept(kCallA, "u-a2", 1000U)));
@@ -261,7 +468,7 @@ void testExpiredInvitationCannotBeAccepted() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
@@ -277,16 +484,14 @@ void testRingingSessionExpiresOnTheStationSide() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
-  char callId[cell::kCallIdLength + 1] = {0};
-  TEST_ASSERT_FALSE(
-      table.expireRinging(1000U + cell::kCallRingTimeoutMs, callId, sizeof(callId)));
-  TEST_ASSERT_TRUE(
-      table.expireRinging(1000U + cell::kCallRingTimeoutMs + 1U, callId, sizeof(callId)));
-  TEST_ASSERT_EQUAL_STRING(kCallA, callId);
+  cell::CallSession expired;
+  TEST_ASSERT_FALSE(table.expireRinging(1000U + cell::kCallRingTimeoutMs, expired));
+  TEST_ASSERT_TRUE(table.expireRinging(1000U + cell::kCallRingTimeoutMs + 1U, expired));
+  TEST_ASSERT_EQUAL_STRING(kCallA, expired.callId);
   TEST_ASSERT_NULL(table.find(kCallA));
 }
 
@@ -296,21 +501,20 @@ void testDisconnectionReleasesTheSessionAndThePeerIsReported() {
   addUser(cellA, "u-a2");
   addUser(cellA, "u-a3");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.accept(kCallA, "u-a2", 1200U)));
 
-  char peer[cell::kCallUserLength] = {0};
-  char callId[cell::kCallIdLength + 1] = {0};
+  cell::CallSession ended;
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.endForUser("u-a2", cell::CallEndReason::kDisconnected,
-                                                      5000U, peer, sizeof(peer), callId,
-                                                      sizeof(callId))));
-  TEST_ASSERT_EQUAL_STRING("u-a1", peer);
-  TEST_ASSERT_EQUAL_STRING(kCallA, callId);
+                                                      5000U, ended)));
+  TEST_ASSERT_EQUAL_STRING("u-a1", ended.caller);
+  TEST_ASSERT_EQUAL_STRING(kCallA, ended.callId);
+  TEST_ASSERT_EQUAL_UINT8(0U, ended.remoteNode);
   TEST_ASSERT_NULL(table.find(kCallA));
 
   // Both users are free again, and the freed slot is reusable.
@@ -325,15 +529,13 @@ void testEndForUserWithoutSessionIsReported() {
   FakeCell cellA;
   addUser(cellA, "u-a1");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
-  char peer[cell::kCallUserLength] = {0};
-  char callId[cell::kCallIdLength + 1] = {0};
+  cell::CallSession ended;
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kUnknownCall),
                     static_cast<int>(table.endForUser("u-a1", cell::CallEndReason::kDisconnected,
-                                                      1000U, peer, sizeof(peer), callId,
-                                                      sizeof(callId))));
-  TEST_ASSERT_EQUAL_STRING("", peer);
+                                                      1000U, ended)));
+  TEST_ASSERT_EQUAL_STRING("", ended.callId);
 }
 
 void testEstablishedCallWithoutMediaIsDropped() {
@@ -341,24 +543,20 @@ void testEstablishedCallWithoutMediaIsDropped() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.accept(kCallA, "u-a2", 1200U)));
 
-  char callId[cell::kCallIdLength + 1] = {0};
-  char caller[cell::kCallUserLength] = {0};
-  char callee[cell::kCallUserLength] = {0};
+  cell::CallSession expired;
   const uint32_t alive = 1200U + cell::kCallMediaTimeoutMs;
-  TEST_ASSERT_FALSE(table.expireStaleMedia(alive, callId, sizeof(callId), caller, sizeof(caller),
-                                           callee, sizeof(callee)));
-  TEST_ASSERT_TRUE(table.expireStaleMedia(alive + 1U, callId, sizeof(callId), caller,
-                                          sizeof(caller), callee, sizeof(callee)));
-  TEST_ASSERT_EQUAL_STRING(kCallA, callId);
-  TEST_ASSERT_EQUAL_STRING("u-a1", caller);
-  TEST_ASSERT_EQUAL_STRING("u-a2", callee);
+  TEST_ASSERT_FALSE(table.expireStaleMedia(alive, expired));
+  TEST_ASSERT_TRUE(table.expireStaleMedia(alive + 1U, expired));
+  TEST_ASSERT_EQUAL_STRING(kCallA, expired.callId);
+  TEST_ASSERT_EQUAL_STRING("u-a1", expired.caller);
+  TEST_ASSERT_EQUAL_STRING("u-a2", expired.callee);
   TEST_ASSERT_NULL(table.find(kCallA));
 }
 
@@ -367,7 +565,7 @@ void testMediaKeepsTheSessionAlive() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
@@ -375,14 +573,11 @@ void testMediaKeepsTheSessionAlive() {
                     static_cast<int>(table.accept(kCallA, "u-a2", 1200U)));
 
   uint32_t now = 1200U;
-  char callId[cell::kCallIdLength + 1] = {0};
-  char caller[cell::kCallUserLength] = {0};
-  char callee[cell::kCallUserLength] = {0};
+  cell::CallSession expired;
   for (int i = 0; i < 40; ++i) {
     now += cell::kCallMediaTimeoutMs / 2U;
     table.noteMedia(kCallA, now);
-    TEST_ASSERT_FALSE(table.expireStaleMedia(now, callId, sizeof(callId), caller,
-                                             sizeof(caller), callee, sizeof(callee)));
+    TEST_ASSERT_FALSE(table.expireStaleMedia(now, expired));
   }
   TEST_ASSERT_NOT_NULL(table.find(kCallA));
 }
@@ -396,7 +591,7 @@ void testRepeatedInvitationsAreRateLimited() {
   addUser(cellA, "u-a2");
   addUser(cellA, "u-a3");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
@@ -416,7 +611,7 @@ void testInvalidCallIdIsRefused() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kInvalidCallId),
                     static_cast<int>(table.invite("short", "u-a1", "u-a2", 1000U)));
@@ -432,7 +627,7 @@ void testCallTableIsBoundedAndNeverLeaks() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   const char* callIds[cell::kMaxCallSessions] = {kCallA, kCallB, kCallC, kCallD};
   uint32_t now = 1000U;
@@ -460,7 +655,7 @@ void testMediaRelayOnlyInsideAnActiveSession() {
   addUser(cellA, "u-a2");
   addUser(cellA, "u-a3");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));
@@ -482,7 +677,7 @@ void testMediaRelayStopsWhenTheCallEnds() {
   addUser(cellA, "u-a1");
   addUser(cellA, "u-a2");
   cell::CallTable table;
-  table.begin(probeFake, &cellA);
+  table.begin(probeFake, &cellA, 1);
 
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.invite(kCallA, "u-a1", "u-a2", 1000U)));

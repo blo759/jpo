@@ -19,16 +19,17 @@ système validé sur banc avec trois cartes physiques.
 
 | Élément | État |
 |---|---|
-| Compilation `site_a`, `site_b`, `site_c` | ✅ réalisée sur ce poste (PlatformIO 6.2.0, espressif32 6.6.0) — RAM 24,1 %, Flash 63,8 % |
-| Tests unitaires du cœur de transport + appels (72 tests) | ✅ exécutés sur ce poste (`pio test -e native`) — 72/72 |
-| Tests unitaires JVM de l'application Android (69 tests) | ✅ **exécutés** sur ce poste (JDK 17.0.20.1 + Gradle 8.7 + SDK 34) — 69/69 |
+| Compilation `site_a`, `site_b`, `site_c` | ✅ réalisée sur ce poste (PlatformIO 6.2.0, espressif32 6.6.0) — RAM 24,9 %, Flash 65,1 % |
+| Tests unitaires du cœur de transport, des appels et de la dorsale Wi‑Fi (103 tests) | ✅ exécutés sur ce poste (`pio test -e native`) — 103/103 |
+| Tests unitaires JVM de l'application Android (71 tests) | ✅ **exécutés** sur ce poste (JDK 17.0.20.1 + Gradle 8.7 + SDK 34) — 71/71 |
 | Compilation de l'application Android | ✅ `testDebugUnitTest assembleDebug assembleRelease` → `BUILD SUCCESSFUL` (`app-debug.apk` 15,9 Mo, `app-release.apk` 10,3 Mo) |
 | Génération des trois binaires distincts | ✅ vérifiée (empreintes SHA‑256 différentes) |
-| Appels audio en direct, même cellule | ✅ implémentés (signalisation HTTP + média WebSocket binaire local) — isolation cellulaire vérifiée par tests |
+| Appels audio en direct, même cellule | ✅ implémentés (signalisation HTTP + média WebSocket binaire local) |
+| **Appels audio en direct entre cellules** | ✅ **implémentés** : dorsale IP TCP `WIFI_AP_STA` entre les trois stations (port 8082), signalisation et audio relayés par IP, jamais par le bus |
 | Tests RS485 entre deux / trois cartes | ❌ non réalisés (pas de matériel accessible depuis cet environnement) |
 | Tests Wi‑Fi réels, téléphone ↔ station | ❌ non réalisés |
 | Tests audio de bout en bout | ❌ non réalisés |
-| Appel réel entre deux téléphones | ❌ non réalisé (aucun téléphone ni carte accessible depuis cet environnement) |
+| Appel réel entre deux téléphones (même cellule et intercellulaire) | ❌ non réalisé (aucun téléphone ni carte accessible depuis cet environnement) |
 
 Les sections « Tests » et « Limitations » précisent ce qui reste à valider sur
 le matériel.
@@ -1232,9 +1233,12 @@ projet_jpo/
 │   ├── cell_core/                  # file de priorité, arbitrage, routage, fragmentation
 │   │   ├── include/cell_core.h
 │   │   └── src/cell_core.cpp
-│   └── cell_call/                  # appels locaux : sessions, isolation cellulaire,
-│       ├── include/cell_call.h     #   trame média binaire (pur C++, testé, sans
-│       └── src/cell_call.cpp       #   aucune dépendance au bus RS485)
+│   └── cell_call/                  # appels : sessions locales et intercellulaires,
+│       ├── include/cell_call.h     #   isolation, trame média binaire (pur C++, testé,
+│       └── src/cell_call.cpp       #   sans aucune dépendance au bus RS485)
+│   └── cell_link/                  # dorsale Wi-Fi inter-stations : cadrage binaire,
+│       ├── include/cell_link.h     #   authentification, routage à sauts limités,
+│       └── src/cell_link.cpp       #   vivacité (pur C++, testé, sans le bus)
 ├── src/
 │   ├── main.cpp                    # AP Wi-Fi + démarrage des services
 │   └── common/
@@ -1243,14 +1247,17 @@ projet_jpo/
 │       ├── led_indicators.h        # LED non bloquantes (GPIO25/26)
 │       ├── rs485_bus.h             # UART2 + DE/RE + COBS + LED
 │       ├── mesh_node.h/.cpp        # jeton, présence, ARQ, routage, fragmentation
-│       ├── app_server.h/.cpp       # HTTP REST + WebSocket
+│       ├── wifi_backbone.h/.cpp    # AP conservé + interface STA vers l'amont
+│       ├── station_link.h/.cpp     # dorsale TCP inter-stations (cadrage, relais)
+│       ├── app_server.h/.cpp       # HTTP REST + WebSocket + appels locaux et distants
 │       └── ...
 ├── test/
 │   ├── test_main.cpp               # point d'entrée Unity (native + ESP32)
 │   ├── test_protocol.cpp           # 7 tests protocole
 │   ├── test_core.cpp               # 19 tests cœur (dont validation atomique du routage)
 │   ├── test_reliability.cpp        # 18 tests fiabilité + simulation 2 émetteurs
-│   └── test_call.cpp               # 28 tests appels locaux + garde-fous « pas de RS485 »
+│   ├── test_call.cpp               # 41 tests appels locaux et intercellulaires
+│   └── test_link.cpp               # 22 tests dorsale Wi-Fi + garde-fous « pas de RS485 »
 ├── scripts/
 │   ├── native_toolchain.py         # MinGW fourni par PlatformIO pour env:native
 │   ├── flash_stations.ps1          # compile + téléverse les 3 cartes (mapping de ports)
@@ -1274,8 +1281,8 @@ projet_jpo/
 │           │       ├── text/  (découpage et réassemblage des messages longs)
 │           │       ├── sync/  (politique de l'outbox durable)
 │           │       ├── audio/ (enregistrement, lecture, réassemblage reprenable)
-│           │       ├── call/  (appels locaux : protocole binaire, jitter buffer,
-│           │       │           moteur audio microphone ↔ haut-parleur, garde cellule)
+│           │       ├── call/  (appels : protocole binaire, jitter buffer, moteur
+│           │       │           audio microphone ↔ haut-parleur, garde cellule)
 │           │       ├── wifi/  (SSID, changement de cellule)
 │           │       └── ui/    (ViewModel, écrans Compose, thème)
 │           └── test/java/com/jpo/cellnet/   # tests JVM (chunking, trame binaire,
@@ -1308,18 +1315,29 @@ validation atomique d'une table de présence tronquée et la simulation de deux
 émetteurs concurrents (livraison exactement une fois dans les deux sens, équité
 sous file pleine, récupération après perte de jeton, reprise après un pair muet).
 
-Les **appels locaux** ajoutent 28 tests (`test/test_call.cpp`) : session à deux
-participants, autorisation A1→A2 / B1→B2 / C1→C2, refus des six paires
-intercellulaires, appel à soi‑même, utilisateur inconnu, utilisateur occupé,
-invitation expirée, déconnexion libérant les ressources, expiration d'un appel
-sans média, limitation de cadence des invitations, borne de la table, validation
-du relais média (uniquement dans une session établie, uniquement entre les deux
-participants), codec de la trame binaire (aller‑retour et rejets) et les quatre
+Les **appels** ajoutent 41 tests (`test/test_call.cpp`) : session à deux
+participants, autorisation des appels locaux, sessions intercellulaires
+(invitation sortante et entrante, confirmation de sonnerie, acceptation, refus,
+fin, expiration, déconnexion, nœud contradictoire, utilisateur occupé), appel à
+soi‑même, utilisateur inconnu, utilisateur non connecté ici, invitation expirée,
+déconnexion libérant les ressources, expiration d'un appel sans média,
+limitation de cadence des invitations, borne de la table, validation du relais
+média (uniquement dans une session établie, uniquement entre les deux
+participants), codec de la trame binaire (aller‑retour et rejets) et les
 garde‑fous structurels décrits en 17.12.
 
-**Total : 72 tests natifs** (44 d'origine + 28 d'appel) et **69 tests JVM
-Android** (24 d'origine + 45 d'appel : protocole, tampon de gigue, garde
-cellulaire).
+La **dorsale Wi‑Fi** ajoute 22 tests (`test/test_link.cpp`) : cadrage binaire et
+ses rejets, réassemblage d'un flux TCP, authentification par jeton partagé
+(exactitude de la comparaison), charge utile de signalisation, routage en étoile
+pour les huit paires de cellules, convergence d'une topologie en chaîne,
+anti‑boucle et limite de sauts, effacement des routes après une perte de liaison,
+politique de reconnexion, vivacité, et les cinq garde‑fous structurels qui
+interdisent toute dépendance de la dorsale au bus RS485.
+
+**Total : 103 tests natifs** (44 d'origine + 13 de fiabilisation + 41 d'appel +
+22 de dorsale, la répartition exacte étant visible dans `test_main.cpp`) et
+**71 tests JVM Android** (24 d'origine + 47 d'appel : protocole, tampon de gigue,
+garde cellulaire et appels intercellulaires autorisés).
 
 ---
 
@@ -1536,7 +1554,12 @@ Lecture des résultats :
 
 ---
 
-## 17. Appels audio en direct, strictement locaux à une cellule
+## 17. Appels audio en direct (chemin local)
+
+> Cette section décrit le chemin **local** (deux participants sur la même
+> cellule). La **section 18** décrit l'extension qui permet les appels entre
+> **toutes** les cellules via une dorsale IP Wi‑Fi, sans que l'audio passe jamais
+> par le bus RS485.
 
 ### 17.1 Ce qui a été ajouté
 
@@ -1601,17 +1624,26 @@ une trame RS485 (vérifié par test).
 
 ### 17.5 Isolation cellulaire (règles appliquées côté station)
 
-Un appel est refusé si :
+> **Évolution :** depuis la section 18, les appels **entre cellules** sont pris en
+> charge. Les règles ci‑dessous décrivent le **chemin local** (deux participants
+> sur la même station), qui reste inchangé ; le chemin intercellulaire est décrit
+> en 18.9 et 18.10. Un appel vers une autre cellule n'est plus refusé : il est
+> acheminé par la dorsale Wi‑Fi.
+
+Sur le **chemin local**, un appel est refusé si :
 
 1. le **demandeur** n'a pas de socket WebSocket actif sur **cette** station ;
-2. le **destinataire** n'a pas de socket WebSocket actif sur cette station ;
-3. la table de routage situe le destinataire sur une **autre** station
-   (`409 cross-cell`) ;
-4. l'un des deux est déjà dans une session (`409 busy`) ;
-5. le demandeur s'appelle lui‑même (`400 self-call`) ;
-6. le destinataire est inconnu (`404 unknown-user`) ou hors ligne
+2. le **destinataire** n'a pas de socket WebSocket actif sur cette station
+   (`409 unavailable` : l'appel n'était pas destiné à cette cellule) ;
+3. l'un des deux est déjà dans une session (`409 busy`) ;
+4. le demandeur s'appelle lui‑même (`400 self-call`) ;
+5. le destinataire est inconnu (`404 unknown-user`) ou hors ligne
    (`409 recipient-offline`) ;
-7. le demandeur enchaîne les invitations (`429 call-too-soon`).
+6. le demandeur enchaîne les invitations (`429 call-too-soon`).
+
+Sur le **chemin intercellulaire**, les mêmes règles s'appliquent au participant
+**présent sur la station**, et la station distante applique les siennes à son
+propre participant (voir 18.8 et 18.10).
 
 L'identité de cellule **déclarée par l'application n'est jamais utilisée** : la
 preuve d'appartenance est le socket WebSocket réellement connecté à la station.
@@ -1765,6 +1797,9 @@ augmenter `calls.audioRelayed` sans que `bus.sent` bouge.
 
 ### 17.14 Validation matérielle restant à faire
 
+> Les essais d'appel **intercellulaires** sont décrits en 18.15 ; ceux ci‑dessous
+> concernent le chemin **local** et restent valables.
+
 Aucun téléphone, aucune carte ESP32 et aucune liaison Wi‑Fi réelle n'étant
 accessible depuis cet environnement, **aucun appel réel n'a été passé**. Ce qui
 reste à valider sur banc :
@@ -1795,4 +1830,387 @@ Aucun de ces points n'est couvert par un test automatisé : les tests fournis
 vérifient la logique de session, l'isolation cellulaire, le format des trames,
 le tampon de gigue et l'absence de dépendance au bus — **pas** la qualité audio
 sur matériel réel.
+
+---
+
+## 18. Dorsale Wi‑Fi inter‑stations : appels entre toutes les cellules
+
+### 18.1 Le constat qui impose une dorsale
+
+Les trois stations diffusent chacune leur propre point d'accès, sur des
+sous‑réseaux **distincts** (`10.0.0.1/24`, `10.1.0.1/24`, `10.2.0.1/24`), sans
+routeur, sans câble et sans Internet. **Aucun chemin IP n'existe entre elles.**
+Le seul lien inter‑stations est le bus RS485, interdit pour l'audio.
+
+Pour permettre les appels intercellulaires, il fallait donc **créer** une
+dorsale IP, en complément des points d'accès existants.
+
+### 18.2 Topologie retenue : étoile, `SITE_A` concentrateur
+
+```
+   Téléphones A                Téléphones B                Téléphones C
+        |                           |                           |
+   Wi-Fi CELL_SITE_A           Wi-Fi CELL_SITE_B           Wi-Fi CELL_SITE_C
+        |                           |                           |
+   [ ESP32 SITE_A ]  <-- STA --  [ ESP32 SITE_B ]         [ ESP32 SITE_C ]
+     (concentrateur)  <--------------- STA ----------------------
+```
+
+| Station | AP (inchangé) | Interface STA | Rôle |
+|---|---|---|---|
+| `SITE_A` | `CELL_SITE_A` · `10.0.0.1` | aucune | **concentrateur** : accepte les deux liaisons |
+| `SITE_B` | `CELL_SITE_B` · `10.1.0.1` | connectée à `CELL_SITE_A` | feuille |
+| `SITE_C` | `CELL_SITE_C` · `10.2.0.1` | connectée à `CELL_SITE_A` | feuille |
+
+**Pourquoi l'étoile** et non un maillage complet : un ESP32 n'a **qu'une seule
+radio**. Le mode `WIFI_AP_STA` impose que l'AP et la STA partagent le même canal,
+et la STA ne peut être associée qu'à **un** AP à la fois. Un maillage complet
+(chaque station connectée aux deux autres) est donc impossible avec ce matériel.
+L'étoile offre le meilleur compromis : **au plus un relais** pour n'importe
+quelle paire de cellules, et une seule association par feuille.
+
+**Contrainte de canal** : les trois AP sont diffusés sur le **canal 1**
+(`APP_WIFI_CHANNEL`), valeur identique sur les trois stations. Si l'association
+STA se faisait sur un autre canal, l'AP suivrait et **les téléphones de la
+cellule seraient déconnectés** : la station journalise une erreur explicite si
+elle constate une divergence.
+
+### 18.3 Aucune route IP, aucun NAT, aucun conflit DHCP
+
+La connexion TCP est **toujours ouverte par la station feuille** vers l'adresse
+connue du concentrateur (`10.0.0.1:8082`) ; le concentrateur **répond sur la
+socket déjà ouverte**. Conséquences :
+
+* l'adresse obtenue par DHCP côté STA n'a **jamais** à être connue des autres
+  stations : aucune adresse statique à réserver, **aucun risque de collision
+  avec la plage DHCP** des téléphones ;
+* aucun transfert IP (`ip_forward`, NAPT) n'est activé : les sous‑réseaux restent
+  **isolés**, ce qui évite d'exposer par inadvertance les services d'une cellule
+  aux clients d'une autre ;
+* les **téléphones ne changent rien** : ils restent sur l'AP de leur cellule,
+  avec leur SSID, leur mot de passe et leur adresse. Aucun routage n'est demandé
+  aux téléphones, qui ne peuvent de toute façon pas se joindre directement
+  (sous‑réseaux distincts sans routeur).
+
+### 18.4 Paramètres de configuration
+
+| Macro | Rôle | A | B | C |
+|---|---|---|---|---|
+| `APP_WIFI_CHANNEL` | canal AP + STA (identique partout) | 1 | 1 | 1 |
+| `APP_LINK_PORT` | port TCP de la dorsale (8080/8081 inchangés) | 8082 | 8082 | 8082 |
+| `APP_LINK_UPSTREAM_NODE` | station à laquelle s'attacher (`0` = concentrateur) | 0 | 1 | 1 |
+| `APP_LINK_UPSTREAM_SSID` | SSID de l'AP amont | `""` | `CELL_SITE_A` | `CELL_SITE_A` |
+| `APP_LINK_UPSTREAM_PASSWORD` | mot de passe de l'AP amont | `""` | `cellsitea` | `cellsitea` |
+| `APP_LINK_UPSTREAM_IP` | adresse de l'AP amont | `10.0.0.1` | `10.0.0.1` | `10.0.0.1` |
+| `APP_LINK_TOKEN` | secret partagé authentifiant les stations | *(démo)* | *(démo)* | *(démo)* |
+| `APP_LINK_RETRY_MS` | délai de reconnexion de la STA | 2000 | 2000 | 2000 |
+
+### 18.5 Secrets : valeurs de démonstration
+
+`APP_LINK_TOKEN` est **une valeur de démonstration** (`cellnet-demo-link-token`)
+commise dans `platformio.ini`, comme le sont déjà les mots de passe des points
+d'accès. Le firmware **affiche un avertissement au démarrage** tant que la valeur
+de démonstration est utilisée :
+
+```
+[I][boot] ... 
+[W][boot] the inter-station link token is still the DEMONSTRATION value from
+          platformio.ini: change it before any real deployment
+```
+
+Pour changer les secrets sur un déploiement réel : modifier `platformio.ini`
+(par environnement) ou fournir les macros par un fichier de configuration local
+non commis (`extra_configs`, `build_flags` personnalisés). Aucun secret de
+production ne doit être poussé dans Git. Les mots de passe des AP existants
+n'ont **pas** été modifiés.
+
+
+
+### 18.6 Protocole de la dorsale (lib/cell_link)
+
+Flux TCP, trames binaires préfixées par un en‑tête de 12 octets :
+
+| Offset | Taille | Champ |
+|---|---|---|
+| 0 | 1 | magic `0xC3` |
+| 1 | 1 | version (`1`) |
+| 2 | 1 | type (voir ci‑dessous) |
+| 3 | 1 | drapeaux (réservé) |
+| 4 | 1 | nœud source (**origine réelle**, préservée par les relais) |
+| 5 | 1 | nœud destination (destination **finale**, pas le prochain saut) |
+| 6 | 1 | compteur de sauts (incrémenté à chaque relais) |
+| 7 | 1 | réservé |
+| 8 | 4 | longueur de charge (little endian) |
+| 12 | n | charge utile |
+
+| Type | Valeur | Rôle |
+|---|---|---|
+| `kLinkHello` | `0x81` | identité + jeton partagé (feuille → concentrateur) |
+| `kLinkHelloAck` | `0x82` | liaison acceptée |
+| `kLinkReject` | `0x83` | jeton refusé, socket fermée |
+| `kLinkHeartbeat` | `0x84` | vivacité, 5 s |
+| `kLinkRouteState` | `0x85` | nœuds joignables depuis l'émetteur (masque 1 octet) |
+| `kLinkCallSignal` | `0x90` | signalisation d'appel (58 octets fixes) |
+| `kLinkCallAudio` | `0x91` | trame audio d'appel (trame média `0xA7` telle quelle) |
+
+La numérotation du lien (`0x81`…`0x91`) est **disjointe** de celle du bus
+(`0x01`…`0x14`) : une trame de dorsale ne peut pas être confondue avec une trame
+RS485 (vérifié par test).
+
+**Charge utile de signalisation** (58 octets, largeurs fixes, aucun parsing
+variable) : `[callId:8][action:1][raison:1][de:24][vers:24]`. Actions :
+`invite`, `ringing`, `accept`, `reject`, `cancel`, `hangup`, `ended`.
+
+**Charge utile audio** : la **même** trame média que sur le WebSocket local
+(`0xA7` magic, callId, séquence, PCM 16 bits mono 8 kHz, 40 ms = 640 octets).
+Aucune conversion, aucun base64 : la trame est transmise telle quelle d'un bout à
+l'autre du chemin.
+
+### 18.7 Routage à sauts limités (et sans boucle)
+
+Chaque station connaît :
+
+* ses **pairs directs** (socket établie et authentifiée) ;
+* sa **station amont** (`APP_LINK_UPSTREAM_NODE`) ;
+* les **routes apprises** : un pair annonce périodiquement (10 s) les nœuds qu'il
+  peut joindre ; une station en déduit les cellules qu'elle n'a pas en direct
+  (utile à une topologie en chaîne).
+
+Décision de relais pour une trame destinée à `dst` reçue de `incoming` :
+
+1. `dst == moi` → traitement local (pas de relais) ;
+2. `sauts >= kLinkMaxHops (3)` → **rejet** ;
+3. prochain saut = direct → sinon route apprise → sinon amont ; si aucun, **rejet** ;
+4. si le prochain saut est **la station d'où vient la trame** → **rejet** (anti‑boucle) ;
+5. sinon `sauts++` et émission vers le prochain saut.
+
+La perte d'une liaison **efface** la route directe **et toutes les routes
+apprises à travers elle** (`forgetVia`), ce qui évite un trou noir après une
+déconnexion.
+
+### 18.8 Authentification et durcissement
+
+| Mesure | Mise en œuvre |
+|---|---|
+| Authentification des stations | `kLinkHello` porte le nœud + le **jeton partagé** ; comparaison en **temps constant** (`linkTokenMatches`), jamais un `strcmp` |
+| Jeton vide | refusé : une station mal configurée ne s'ouvre pas à tout le monde |
+| Aucune information rendue | le refus ne renvoie que « refusé » ; le jeton n'est **jamais** réémis |
+| Avant l'handshake | toute trame reçue avant authentification ferme la socket |
+| Une socket par pair | une nouvelle connexion remplace la précédente (pas d'usurpation par accumulation) |
+| Boucles | compteur de sauts + « jamais vers l'expéditeur » |
+| Destinations non autorisées | seuls `kLinkCallSignal` et `kLinkCallAudio` sont relayés ; tout autre type vers un tiers est rejeté |
+| Exposition | aucun service exposé à Internet, aucun transfert IP activé, aucun port ouvert hors du réseau CellNet |
+| Libération des ressources | délai de 15 s sans octet reçu → socket fermée, routes effacées, sessions d'appel de ce pair terminées |
+| Chiffrement | **aucun** chiffrement de bout en bout n'est implémenté, donc **aucun n'est annoncé** : la dorsale circule en clair sur le Wi‑Fi local, comme le reste du prototype |
+
+
+### 18.9 Chemin de signalisation et chemin audio
+
+**Appel local (A1 → A2, même cellule)** — chemin **inchangé** :
+
+```
+Téléphone A1 --HTTP /api/call/invite--> ESP32 SITE_A --WebSocket--> Téléphone A2
+Téléphone A1 --WebSocket binaire 0xA7--> ESP32 SITE_A --WebSocket binaire 0xA7--> Téléphone A2
+```
+La dorsale n'est **pas** utilisée : un appel local ne consomme aucune bande
+passante inter‑stations.
+
+**Appel intercellulaire (A1 → B1)** :
+
+```
+1. Téléphone A1 --HTTP /api/call/invite {callId,from,to}--> ESP32 SITE_A
+2. SITE_A : table de routage -> B1 est sur le nœud 2 -> session locale « remote »
+3. SITE_A --TCP 8082 kLinkCallSignal{invite}--> ESP32 SITE_B
+4. SITE_B : inviteIncoming() -> évènement WebSocket call_invite -> Téléphone B1
+5. SITE_B --TCP 8082 kLinkCallSignal{ringing}--> SITE_A -> call_ringing -> A1
+6. B1 accepte --HTTP /api/call/accept--> SITE_B -> kLinkCallSignal{accept} -> SITE_A
+7. SITE_A -> call_accepted -> A1 ; les deux applications ouvrent leur micro
+
+Audio (bidirectionnel, en parallèle) :
+   A1 --WS binaire 0xA7--> SITE_A --TCP 8082 kLinkCallAudio--> SITE_B --WS binaire 0xA7--> B1
+   B1 --WS binaire 0xA7--> SITE_B --TCP 8082 kLinkCallAudio--> SITE_A --WS binaire 0xA7--> A1
+```
+
+**B ↔ C** : aucune socket directe (l'étoile n'en a pas). La trame est adressée au
+nœud 3 avec `dstNode=3` ; SITE_A la **relaie** vers SITE_C en incrémentant le
+compteur de sauts. Un seul saut de relais, jamais deux.
+
+**Aucune trame d'appel n'est remise au bus**, quel que soit le cas : les
+gestionnaires `/api/call/*`, le relais média WebSocket et la dorsale ne
+contiennent aucun appel à la file d'émission RS485.
+
+**Un appel n'est jamais annoncé comme établi avant que le chemin audio existe** :
+le côté appelant reste en « Appel en cours… » (`call_dialing`) jusqu'à ce que la
+station distante confirme que le téléphone du destinataire **sonne**
+(`kSignalRinging`), et ne passe « En communication » qu'après l'acceptation
+réelle (`kSignalAccept`).
+
+### 18.10 Présence et découverte : réutilisation, pas de duplication
+
+Aucune table de présence parallèle n'a été créée. La **table de routage
+existante** (`RoutingTable`, alimentée par les annonces `ROUTE_STATE` du bus
+RS485) répond déjà à la seule question utile : *sur quelle station se trouve cet
+utilisateur ?* Elle est donc utilisée telle quelle pour choisir la destination
+d'une invitation. Le RS485 conserve donc **toutes** ses fonctions (présence,
+répertoire, routage, jeton, files, accusés) : il n'est simplement **jamais**
+emprunté par un paquet audio ou par une trame de signalisation d'appel.
+
+Le mécanisme ajouté côté dorsale est limité à ce qui est indispensable :
+
+| Besoin | Mécanisme |
+|---|---|
+| Une station sait qu'une autre est joignable | authentification `kLinkHello`/`kLinkHelloAck` → pair direct |
+| Une station sait quelles cellules elle peut joindre | annonce `kLinkRouteState` (masque 1 octet, toutes les 10 s et à l'établissement) |
+| Une liaison est morte | silence de plus de 15 s → socket fermée, routes effacées |
+| Un utilisateur change de cellule | inchangé : sa station publie sa présence sur le bus, la table de routage se met à jour |
+| Éviter les doublons d'invitation | `inviteRemote`/`inviteIncoming` refusent si l'utilisateur local est déjà dans une session, et l'anti‑abus de cadence s'applique |
+| Informations contradictoires | la table de routage existante est seule juge (une entrée par utilisateur, mise à jour par la station propriétaire) |
+| Confidentialité | seules la signalisation et l'audio **des participants** traversent la dorsale : aucun contenu de conversation ni paquet audio n'est diffusé aux stations non concernées |
+
+
+### 18.11 Interface Android
+
+* Le **bouton d'appel** de la conversation est actif dès qu'une cellule est
+  identifiée et que la station répond : il n'est plus limité aux utilisateurs de
+  la cellule courante.
+* L'en‑tête de la conversation indique la destination quand elle est distante :
+  « Vous êtes sur SITE_A · appel vers SITE_B ».
+* L'écran d'appel affiche « Appel inter-cellules · Wi-Fi CellNet · vers SITE_B »
+  (ou « Appel local à la cellule · Wi-Fi CellNet »).
+* Les états affichés sont ceux réellement reçus : « Appel vers SITE_B… » pendant
+  l'acheminement, « Appel en cours… » quand le destinataire sonne, « En
+  communication » seulement après acceptation.
+* Les refus sont explicites : cellule du destinataire inconnue, liaison Wi‑Fi
+  entre stations indisponible, correspondant occupé / indisponible / non
+  connecté, invitation expirée.
+* Le reste de l'application est inchangé : messages, vocaux enregistrés,
+  répertoire, persistance Room, historique, découpage du texte, reprise des
+  transferts.
+
+### 18.12 Tests exécutés
+
+```powershell
+# Tests natifs : 103 (72 précédents + 31 nouveaux pour la dorsale et les appels intercellulaires)
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" test -e native
+
+# Les trois firmwares
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e site_a -e site_b -e site_c
+
+# Application Android : 71 tests JVM + APK
+cd mobile
+gradle testDebugUnitTest assembleDebug assembleRelease
+```
+
+**Résultats obtenus sur ce poste** : `103 test cases: 103 succeeded` ·
+`site_a`/`site_b`/`site_c` SUCCESS (RAM 24,9 %, Flash 65,1 %) ·
+`BUILD SUCCESSFUL` avec **71 tests JVM, 0 échec**.
+
+Couverture ajoutée (natif) :
+
+| Domaine | Tests |
+|---|---|
+| Trame de dorsale | aller‑retour, 6 formes de rejet (magic, version, longueur incohérente, source nulle, troncature) |
+| Réassemblage de flux TCP | deux trames dans un flux, resynchronisation après octets parasites |
+| Authentification | aller‑retour `hello`, jeton exact (préfixe, plus long, un caractère différent, jeton vide refusé) |
+| Signalisation | aller‑retour 58 octets, rejets (taille, action inconnue, champ non terminé, identifiant invalide) |
+| Routage étoile | les **8 paires** A→A, A→B, A→C, B→A, B→B, B→C, C→A, C→B, C→C (les paires locales sans saut de lien) |
+| Routage chaîne | convergence par annonce, amont, pas de trou noir |
+| Anti‑boucle | jamais de retour à l'expéditeur, limite de sauts, destination inconnue |
+| Reconnexion / vivacité | délai de nouvelle tentative, comptage, pair muet |
+| Sessions intercellulaires | invitation sortante/entrante, confirmation de sonnerie, acceptation, refus, fin, expiration, déconnexion, utilisateur occupé, nœud contradictoire, appel local toujours possible sans dorsale |
+| Garde‑fous structurels | `cell_link` sans dépendance au bus ; `station_link`/`wifi_backbone` sans référence au maillage ; `mesh_node`/`cell_protocol` sans référence aux appels ni à la dorsale ; magics disjoints ; chemin des vocaux enregistrés intact |
+
+Couverture ajoutée (JVM Android) : les **8 paires de cellules autorisées**, refus
+d'une cellule hors déploiement, indicateur « appel intercellulaire », machine à
+phases, plus les tests de trame média et de tampon de gigue déjà présents.
+
+### 18.13 Limites connues
+
+* **Topologie en étoile** : si `SITE_A` (concentrateur) s'arrête, les appels
+  **locaux** de B et C continuent, mais les appels **B ↔ C** deviennent
+  impossibles (B et C perdent aussi l'accès à A). Un maillage complet
+  nécessiterait une seconde radio par station.
+* **Une seule association STA par station** : conséquence directe du matériel
+  (radio unique). La topologie en chaîne fonctionne (via les annonces de routes)
+  mais ajoute un saut pour les cellules éloignées.
+* **Canal unique** : les trois AP doivent rester sur le même canal. Changer le
+  canal d'une seule station casserait son AP ou sa liaison.
+* **Débit du concentrateur** : un appel B ↔ C traverse `SITE_A` deux fois (un
+  sens par participant), soit ≈ 33 kB/s en plus de son propre trafic. C'est
+  modeste pour du Wi‑Fi, mais le concentrateur porte la charge de tous les appels
+  intercellulaires.
+* **Pas de chiffrement** : la dorsale circule en clair, comme le reste du
+  prototype.
+* **Deux participants par appel**, 4 sessions par station.
+* **Le relais audio reste côté ESP32** : l'option « audio direct entre
+  téléphones » n'est pas utilisable ici, les téléphones étant sur des
+  sous‑réseaux distincts sans routeur. C'est le relais IP par les ESP32 (option B
+  de la spécification) qui a été retenu, et il est bien **distinct du RS485**.
+
+
+### 18.14 Dépannage de la dorsale
+
+| Symptôme | Cause probable | Action |
+|---|---|---|
+| `link.bypass` … `up=0` et le journal répète « upstream unreachable » | l'AP amont n'est pas encore démarré, ou `APP_LINK_UPSTREAM_SSID`/`PASSWORD` est faux | vérifier le SSID exact et le mot de passe ; démarrer le concentrateur **avant** les feuilles |
+| « access point … failed to start » ou téléphones déconnectés dès que la liaison monte | **divergence de canal** : la STA s'est associée sur un autre canal que celui de l'AP | aligner `APP_WIFI_CHANNEL` sur les trois stations ; le firmware journalise explicitement l'erreur de canal |
+| « rejected node N … invalid token » | `APP_LINK_TOKEN` différent entre les deux stations | rendre les jetons identiques, recompiler et reflasher |
+| « no free link slot » | plus de deux connexions entrantes (topologie inattendue) | vérifier `APP_LINK_UPSTREAM_NODE` : une seule feuille par station attendue |
+| « node N silent for 15000 ms, closing the link » | liaison Wi‑Fi instable ou station distante redémarrée | vérifier le RSSI (`/api/health` → `link`), la distance, le canal ; la reconnexion est automatique |
+| Appel intercellulaire refusé avec « cell-unreachable » | la station du destinataire n'est **pas joignable** sur la dorsale (paire non authentifiée) | consulter `/api/health` → `link.peers` (masque des pairs directs) et `link.upstreamConnected` |
+| `link.framesRelayed` qui grimpe anormalement | topologie en chaîne ou boucle de configuration | vérifier `APP_LINK_UPSTREAM_NODE` sur les trois stations ; `link.framesDropped` doit rester faible |
+| Appel établi mais **aucun son** | la dorsale transporte la signalisation mais pas l'audio (`link.audioSent`/`audioReceived` à 0) | vérifier que `calls.audioForwarded` augmente côté appelant ; si la dorsale est tombée en cours d'appel, l'appel est terminé au bout du délai de média (20 s) |
+| Les LED RS485 clignotent pendant un appel | **anomalie** : l'audio ne doit jamais passer par le bus | vérifier `bus.sent` dans `/api/health` : il doit rester stable pendant un appel ; les tests `testStationCallHandlersNeverSubmitToTheMesh` et `testStationLinkGlueNeverUsesTheMesh` couvrent ce point |
+
+Diagnostic utile :
+
+```powershell
+# une seule cellule
+.\scripts\station_doctor.ps1 -Cell A
+
+# état de la dorsale et des appels
+Invoke-RestMethod http://10.0.0.1:8080/api/health | ConvertTo-Json -Depth 4
+Invoke-RestMethod "http://10.0.0.1:8080/api/call/state?userId=u-a1" | ConvertTo-Json
+```
+
+Le bloc `link` de `/api/health` expose : `upstream`, `upstreamReady`,
+`upstreamConnected`, `peers` (masque des pairs directs), `framesSent`,
+`framesReceived`, `framesRelayed`, `framesDropped`, `signalsSent`,
+`signalsReceived`, `audioSent`, `audioReceived`, `authRejections`,
+`disconnects`. Le bloc `calls` expose en plus `remoteCalls`, `audioForwarded`,
+`audioFromLink`.
+
+### 18.15 Essais matériels restant à effectuer
+
+Aucun ESP32, aucun téléphone et aucune liaison Wi‑Fi réelle n'étant accessible
+depuis cet environnement, **aucun appel intercellulaire réel n'a été passé**.
+Ce qui reste à valider sur banc :
+
+1. **Montée de la dorsale** : au démarrage des trois cartes, `SITE_B` et
+   `SITE_C` doivent journaliser « backbone up: attached to node 1 » et
+   `/api/health` doit montrer `link.peers = 0x3` sur `SITE_A` et
+   `link.upstreamConnected = true` sur B et C.
+2. **AP conservés** : les trois SSID doivent rester visibles et les téléphones
+   connectés à leur cellule pendant que la liaison inter‑stations est active.
+3. **Appel A → A** (même cellule) : doit continuer à fonctionner exactement comme
+   avant, sans aucune trame sur la dorsale (`link.signalsSent` stable).
+4. **Appel A → B**, **A → C**, **B → A**, **B → C**, **C → A**, **C → B** : sonnerie,
+   acceptation, conversation **audible dans les deux sens**, raccrochage.
+5. **Refus / occupation / expiration** d'un appel intercellulaire.
+6. **Perte de liaison en cours d'appel** : couper la liaison Wi‑Fi de B pendant un
+   appel A↔B → les deux côtés doivent terminer proprement l'appel au bout du délai
+   de média, et les messages texte/vocaux continuer de fonctionner.
+7. **Non‑régression messagerie** : pendant et après un appel intercellulaire,
+   vérifier textes et vocaux enregistrés **en local** et **A↔B, A↔C, B↔C**, avec
+   accusés « livré » puis « lu ».
+8. **Charge** : `calls.audioRelayed`, `link.framesRelayed`, `system.heapMin` et
+   `maxLoopUs` sur un appel B ↔ C de 5 min (le concentrateur relaie alors deux
+   flux), plus la vérification que l'AP de `SITE_A` reste stable.
+9. **Mesures** : latence audio perçue, pertes (`calls.audioSilent`), stabilité du
+   RSSI de la liaison, maintien des points d'accès.
+
+Aucun de ces points n'est couvert par un test automatisé : les tests fournis
+vérifient la logique de session, le routage, l'authentification, le format des
+trames, la reconnexion et l'absence de dépendance au bus — **pas** la qualité
+audio ni la stabilité radio sur matériel réel.
 

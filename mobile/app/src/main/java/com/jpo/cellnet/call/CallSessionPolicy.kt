@@ -25,17 +25,26 @@ enum class CallRefusal {
     NO_CELL,
     SELF,
     UNKNOWN_USER,
-    CROSS_CELL,
+
+    /**
+     * The recipient is registered on a station that is not part of the
+     * deployment, so there is no way to route the call to it.
+     */
+    UNKNOWN_CELL,
     NOT_CONNECTED
 }
 
 /**
  * Client side guard of the call feature.
  *
- * The station is authoritative (it refuses a cross cell call even if the
- * application asks for one), but the application must never let the user start a
- * call that cannot work: it checks the *local* cell against the station the peer
- * is registered on before sending anything.
+ * The station is authoritative (it decides whether the recipient is reachable
+ * and refuses a call it cannot route), but the application must never let the
+ * user start a call that cannot work: it checks the *local* station and the cell
+ * the peer is registered on before sending anything.
+ *
+ * Calls are allowed between any two cells of the deployment: when the peer is on
+ * another cell, the station routes the signalling and the audio over the Wi-Fi
+ * backbone. Only a peer whose cell is not part of the deployment is refused.
  *
  * Pure Kotlin: unit tested on the JVM without Android.
  */
@@ -47,7 +56,8 @@ object CallSessionPolicy {
         peerStation: String?,
         peerId: String,
         selfId: String,
-        stationConnected: Boolean
+        stationConnected: Boolean,
+        knownCells: Set<String> = emptySet()
     ): CallRefusal {
         if (phase != CallPhase.IDLE) return CallRefusal.BUSY
         if (peerId.isBlank() || peerId == selfId) {
@@ -56,8 +66,18 @@ object CallSessionPolicy {
         if (localCell.isNullOrBlank()) return CallRefusal.NO_CELL
         if (!stationConnected) return CallRefusal.NOT_CONNECTED
         if (peerStation.isNullOrBlank()) return CallRefusal.UNKNOWN_USER
-        if (!peerStation.equals(localCell, ignoreCase = true)) return CallRefusal.CROSS_CELL
+        // The peer may be on this cell or on another one: both are allowed. A
+        // station outside the deployment, however, cannot be reached at all.
+        if (knownCells.isNotEmpty() && knownCells.none { it.equals(peerStation, ignoreCase = true) }) {
+            return CallRefusal.UNKNOWN_CELL
+        }
         return CallRefusal.NONE
+    }
+
+    /** True when the two users are not on the same cell (the call crosses cells). */
+    fun isCrossCell(localCell: String?, peerStation: String?): Boolean {
+        if (localCell.isNullOrBlank() || peerStation.isNullOrBlank()) return false
+        return !peerStation.equals(localCell, ignoreCase = true)
     }
 
     /**
@@ -94,9 +114,8 @@ object CallSessionPolicy {
         CallRefusal.BUSY -> "Un appel est déjà en cours"
         CallRefusal.NO_CELL -> "Connectez le téléphone à une cellule pour appeler"
         CallRefusal.SELF -> "Vous ne pouvez pas vous appeler vous-même"
-        CallRefusal.UNKNOWN_USER -> "Destinataire inconnu dans cette cellule"
-        CallRefusal.CROSS_CELL ->
-            "Les appels en direct sont limités aux utilisateurs de votre cellule"
+        CallRefusal.UNKNOWN_USER -> "Destinataire inconnu : ouvrez son application"
+        CallRefusal.UNKNOWN_CELL -> "Cellule du destinataire inconnue"
         CallRefusal.NOT_CONNECTED -> "Station injoignable : appel impossible"
     }
 
@@ -109,6 +128,9 @@ object CallSessionPolicy {
         "disconnected" -> "Appel terminé (correspondant déconnecté)"
         "busy" -> "Correspondant occupé"
         "unavailable" -> "Correspondant indisponible"
+        "cross-cell" -> "Cellule du correspondant injoignable"
+        "cell-unreachable" -> "Liaison Wi-Fi entre stations indisponible"
+        "link-unavailable" -> "Liaison Wi-Fi entre stations indisponible"
         null, "" -> "Appel terminé"
         else -> "Appel terminé ($reason)"
     }

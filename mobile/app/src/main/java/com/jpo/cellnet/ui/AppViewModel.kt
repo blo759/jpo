@@ -88,6 +88,12 @@ data class CallUiState(
     val incoming: Boolean = false,
     val muted: Boolean = false,
     val speaker: Boolean = true,
+    /**
+     * Cell hosting the other participant when the call crosses cells, null for a
+     * same-cell call. Displayed so the user knows the call goes over the Wi-Fi
+     * backbone between stations.
+     */
+    val remoteCell: String? = null,
     val startedAt: Long = 0L,
     val connectedAt: Long? = null,
     /** Refreshed once per second while the call is established. */
@@ -1734,7 +1740,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             peerStation = peerStation,
             peerId = peerId,
             selfId = profile.userId,
-            stationConnected = snapshot.httpConnected && snapshot.wsConnected
+            stationConnected = snapshot.httpConnected && snapshot.wsConnected,
+            knownCells = Cells.all.map { it.site }.toSet()
         )
         if (refusal != CallRefusal.NONE) {
             _state.update { it.copy(error = CallSessionPolicy.refusalMessage(refusal)) }
@@ -1746,6 +1753,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val callId = CallProtocol.newCallId()
+        val remoteCell =
+            if (CallSessionPolicy.isCrossCell(snapshot.cellSite, peerStation)) peerStation else null
         _state.update {
             it.copy(
                 call = CallUiState(
@@ -1755,8 +1764,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     peerName = peerName,
                     incoming = false,
                     speaker = true,
+                    remoteCell = remoteCell,
                     startedAt = System.currentTimeMillis(),
-                    detail = "Appel en cours…"
+                    detail = if (remoteCell == null) "Appel en cours…" else "Appel vers $remoteCell…"
                 ),
                 error = null
             )
@@ -1877,7 +1887,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 val phase = CallSessionPolicy.applyEvent(current.phase, type, isCaller = false)
                 if (phase != CallPhase.RINGING) return
-                val name = _state.value.users.firstOrNull { it.id == from }?.name ?: from
+                val peer = _state.value.users.firstOrNull { it.id == from }
+                val name = peer?.name ?: from
+                // The caller is on another cell when its station differs from the
+                // one this phone is attached to: the call then crosses the Wi-Fi
+                // backbone between the two stations.
+                val remoteCell = if (CallSessionPolicy.isCrossCell(_state.value.cellSite,
+                                                                  peer?.station)) {
+                    peer?.station
+                } else {
+                    null
+                }
                 _state.update {
                     it.copy(
                         call = CallUiState(
@@ -1887,8 +1907,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             peerName = name,
                             incoming = true,
                             speaker = true,
+                            remoteCell = remoteCell,
                             startedAt = System.currentTimeMillis(),
-                            detail = "Appel entrant"
+                            detail = if (remoteCell == null) {
+                                "Appel entrant"
+                            } else {
+                                "Appel entrant de $remoteCell"
+                            }
                         ),
                         error = null
                     )
@@ -1900,6 +1925,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             "call_ringing" -> {
                 if (current.callId != callId || current.phase != CallPhase.DIALING) return
                 _state.update { it.copy(call = it.call.copy(detail = "Appel en cours…")) }
+            }
+
+            // Cross cell call: the station accepted the invitation and routed it
+            // over the Wi-Fi backbone, but the remote station has not confirmed
+            // yet that the recipient's phone is ringing. The call is therefore
+            // not reported as ringing, and no media is opened.
+            "call_dialing" -> {
+                if (current.callId != callId || current.phase != CallPhase.DIALING) return
+                _state.update {
+                    it.copy(
+                        call = it.call.copy(
+                            detail = it.call.remoteCell?.let { cell -> "Appel vers $cell…" }
+                                ?: "Appel en cours…"
+                        )
+                    )
+                }
             }
 
             "call_accepted" -> {
@@ -2095,10 +2136,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun callRefusalMessage(status: String): String = when (status) {
-        "cross-cell" -> "Appel impossible : le correspondant est sur une autre cellule"
+        "cross-cell" -> "Cellule du correspondant injoignable"
+        "cell-unreachable" -> "Liaison Wi-Fi entre stations indisponible"
+        "link-unavailable" -> "Liaison Wi-Fi entre stations indisponible"
         "busy" -> "Correspondant déjà en communication"
-        "recipient-offline" -> "Correspondant non connecté à cette cellule"
-        "unknown-user" -> "Destinataire inconnu dans cette cellule"
+        "recipient-offline" -> "Correspondant non connecté au réseau"
+        "unknown-user" -> "Destinataire inconnu : ouvrez son application"
         "self-call" -> "Vous ne pouvez pas vous appeler vous-même"
         "unavailable" -> "Correspondant indisponible"
         "call-too-soon" -> "Patientez un instant avant de rappeler"

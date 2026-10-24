@@ -65,8 +65,8 @@ size_t base64Decode(const char* input, size_t length, uint8_t* output, size_t ca
 
 }  // namespace
 
-AppServer::AppServer(MeshNode& mesh, const StationConfig& config)
-    : mesh_(mesh), config_(config), http_(config.servicePort), ws_(config.wsPort) {
+AppServer::AppServer(MeshNode& mesh, StationLink& link, const StationConfig& config)
+    : mesh_(mesh), link_(link), config_(config), http_(config.servicePort), ws_(config.wsPort) {
   memset(socketUsers_, 0, sizeof(socketUsers_));
 }
 
@@ -91,9 +91,10 @@ void AppServer::begin() {
   http_.onNotFound([this]() { handleNotFound(); });
   http_.begin();
 
-  // The call table only trusts this station's own WebSocket bindings, so a user
-  // of another cell can never be invited.
-  calls_.begin(&AppServer::probeLocalUser, this);
+  // The call table only trusts this station's own WebSocket bindings to decide
+  // that a participant is local, and knows its own node id to decide whether a
+  // session goes over the Wi-Fi backbone.
+  calls_.begin(&AppServer::probeLocalUser, this, config_.nodeId);
 
   ws_.begin();
   ws_.onEvent([this](uint8_t clientNumber, WStype_t type, uint8_t* payload, size_t length) {
@@ -146,6 +147,22 @@ void appendJsonEscaped(String& out, const char* text) {
       out += value;
     }
   }
+}
+
+// Copies a bounded, zero padded identifier into a fixed width field.
+void copyField(char* destination, size_t capacity, const char* source) {
+  if (capacity == 0U) {
+    return;
+  }
+  memset(destination, 0, capacity);
+  if (source == nullptr) {
+    return;
+  }
+  size_t length = 0;
+  while (length + 1U < capacity && source[length] != '\0') {
+    ++length;
+  }
+  memcpy(destination, source, length);
 }
 
 }  // namespace
@@ -490,6 +507,33 @@ void AppServer::handleHealth() {
   calls["transport"] = "websocket-binary";
   calls["sampleRate"] = 8000;
   calls["frameMs"] = 40;
+  calls["remoteCalls"] = callRemote_;
+  calls["audioForwarded"] = callAudioForwarded_;
+  calls["audioFromLink"] = callAudioFromLink_;
+  calls["signalsSent"] = callSignalsSent_;
+  calls["signalsReceived"] = callSignalsReceived_;
+
+  // Additive block: state of the inter-station Wi-Fi backbone. A cross cell call
+  // uses this link for its signalling and for its audio; the bus counters below
+  // are untouched by a call, whatever its kind.
+  JsonObject link = doc["link"].to<JsonObject>();
+  link["node"] = config_.nodeId;
+  link["port"] = config_.linkPort;
+  link["upstream"] = link_.routes().upstream();
+  link["upstreamReady"] = link_.upstreamReady();
+  link["upstreamConnected"] = link_.upstream().connected();
+  link["peers"] = link_.directMask();
+  link["framesSent"] = link_.framesSent();
+  link["framesReceived"] = link_.framesReceived();
+  link["framesRelayed"] = link_.framesRelayed();
+  link["framesDropped"] = link_.framesDropped();
+  link["signalsSent"] = link_.signalsSent();
+  link["signalsReceived"] = link_.signalsReceived();
+  link["audioSent"] = link_.audioSent();
+  link["audioReceived"] = link_.audioReceived();
+  link["authRejections"] = link_.authRejections();
+  link["disconnects"] = link_.disconnects();
+  link["transport"] = "tcp-wifi-backbone";
 
   String out;
   serializeJson(doc, out);
@@ -585,26 +629,28 @@ void AppServer::handleCallInvite() {
     return;
   }
 
-  // Explicit cellular check first: when the recipient is known but belongs to
-  // another station, the refusal names the real reason instead of a generic
-  // error. A cross cell call is a normal, expected answer here.
+  // The recipient must be known and online. The routing table is the presence
+  // information maintained by the RS485 mesh: it is reused as is, never
+  // duplicated, and only tells us *where* the user is.
   const RouteEntry* target = mesh_.routing().find(to);
   if (target == nullptr) {
     sendStatus(404, "unknown-user", "the recipient was never seen on this network");
     return;
   }
-  if (target->station != config_.nodeId) {
-    sendStatus(409, "cross-cell",
-               "real time calls are restricted to users connected to this cell");
-    return;
-  }
   if (!target->online) {
-    sendStatus(409, "recipient-offline", "the recipient is not connected to this cell");
+    sendStatus(409, "recipient-offline", "the recipient is not connected to this network");
     return;
   }
 
-  // Authoritative check: both participants must hold a live socket on *this*
-  // station. The declared "cell" of a client is never trusted.
+  if (target->station != config_.nodeId) {
+    // The recipient is in another cell: the signalling goes over the Wi-Fi
+    // backbone. The audio will follow the same path once the call is accepted.
+    handleCallInviteRemote(callId, from, to, *target);
+    return;
+  }
+
+  // Local call: both participants must hold a live socket on *this* station.
+  // The declared "cell" of a client is never trusted. Unchanged path.
   const CallStatus status = calls_.invite(callId, from, to, millis());
   if (status != CallStatus::kOk) {
     replyCallStatus(status);
@@ -625,6 +671,7 @@ void AppServer::handleCallInvite() {
   out["callId"] = session->callId;
   out["cell"] = config_.siteId;
   out["to"] = session->callee;
+  out["remote"] = false;
   String text;
   serializeJson(out, text);
   sendJson(202, text);
@@ -653,11 +700,21 @@ void AppServer::handleCallAccept() {
     sendStatus(500, "internal-error");
     return;
   }
-  // Both participants open the media channel at the same instant.
-  pushCallEvent(session->caller, "call_accepted", *session, nullptr, nullptr);
-  pushCallEvent(session->callee, "call_accepted", *session, nullptr, nullptr);
-  LOG_I("call", "%s accepted the call of %s (%s)", session->callee, session->caller,
-        session->callId);
+  if (session->remoteNode == 0U) {
+    // Local call: both participants open the media channel at the same instant.
+    pushCallEvent(session->caller, "call_accepted", *session, nullptr, nullptr);
+    pushCallEvent(session->callee, "call_accepted", *session, nullptr, nullptr);
+  } else {
+    // One participant is in another cell: it is notified over the backbone, and
+    // only the local participant receives the WebSocket event.
+    sendRemoteSignal(*session, kSignalAccept);
+    const char* local = localParticipant(*session);
+    if (local != nullptr) {
+      pushCallEvent(local, "call_accepted", *session, nullptr, nullptr);
+    }
+  }
+  LOG_I("call", "%s accepted the call of %s (%s)%s", session->callee, session->caller,
+        session->callId, session->remoteNode == 0U ? "" : " across the Wi-Fi backbone");
   sendStatus(200, "active");
 }
 
@@ -676,8 +733,10 @@ void AppServer::handleCallReject() {
   }
   const CallSession* session = calls_.find(callId);
   char caller[kCallUserLength] = {0};
+  uint8_t remoteNode = 0;
   if (session != nullptr) {
     strncpy(caller, session->caller, sizeof(caller) - 1U);
+    remoteNode = session->remoteNode;
   }
   const CallStatus status = calls_.reject(callId, userId, millis());
   if (status != CallStatus::kOk) {
@@ -685,6 +744,18 @@ void AppServer::handleCallReject() {
     return;
   }
   notifyCallEnded(caller, callId, userId, "call_rejected", "rejected");
+  if (remoteNode != 0U) {
+    // The caller is in another cell: it must learn that the call was refused.
+    LinkCallSignal signal;
+    copyField(signal.callId, sizeof(signal.callId), callId);
+    signal.action = kSignalReject;
+    signal.reason = static_cast<uint8_t>(CallEndReason::kRejected);
+    copyField(signal.from, sizeof(signal.from), caller);
+    copyField(signal.to, sizeof(signal.to), userId);
+    if (link_.sendSignal(signal, remoteNode)) {
+      ++callSignalsSent_;
+    }
+  }
   LOG_I("call", "%s rejected the call of %s (%s)", userId, caller, callId);
   sendStatus(200, "rejected");
 }
@@ -704,8 +775,10 @@ void AppServer::handleCallCancel() {
   }
   const CallSession* session = calls_.find(callId);
   char callee[kCallUserLength] = {0};
+  uint8_t remoteNode = 0;
   if (session != nullptr) {
     strncpy(callee, session->callee, sizeof(callee) - 1U);
+    remoteNode = session->remoteNode;
   }
   const CallStatus status = calls_.cancel(callId, userId, millis());
   if (status != CallStatus::kOk) {
@@ -713,6 +786,18 @@ void AppServer::handleCallCancel() {
     return;
   }
   notifyCallEnded(callee, callId, userId, "call_cancelled", "cancelled");
+  if (remoteNode != 0U) {
+    // The recipient is in another cell: its station must stop ringing.
+    LinkCallSignal signal;
+    copyField(signal.callId, sizeof(signal.callId), callId);
+    signal.action = kSignalCancel;
+    signal.reason = static_cast<uint8_t>(CallEndReason::kCancelled);
+    copyField(signal.from, sizeof(signal.from), userId);
+    copyField(signal.to, sizeof(signal.to), callee);
+    if (link_.sendSignal(signal, remoteNode)) {
+      ++callSignalsSent_;
+    }
+  }
   LOG_I("call", "%s cancelled the call to %s (%s)", userId, callee, callId);
   sendStatus(200, "cancelled");
 }
@@ -732,9 +817,11 @@ void AppServer::handleCallHangup() {
   }
   const CallSession* session = calls_.find(callId);
   char peer[kCallUserLength] = {0};
+  uint8_t remoteNode = 0;
   if (session != nullptr) {
     const char* other = strcmp(session->caller, userId) == 0 ? session->callee : session->caller;
     strncpy(peer, other, sizeof(peer) - 1U);
+    remoteNode = session->remoteNode;
   }
   const CallStatus status = calls_.hangup(callId, userId, millis());
   if (status != CallStatus::kOk) {
@@ -742,8 +829,109 @@ void AppServer::handleCallHangup() {
     return;
   }
   notifyCallEnded(peer, callId, userId, "call_ended", "hangup");
+  if (remoteNode != 0U) {
+    // The other participant is in another cell: its station releases its half
+    // and stops the media path immediately.
+    LinkCallSignal signal;
+    copyField(signal.callId, sizeof(signal.callId), callId);
+    signal.action = kSignalHangup;
+    signal.reason = static_cast<uint8_t>(CallEndReason::kHungUp);
+    copyField(signal.from, sizeof(signal.from), userId);
+    copyField(signal.to, sizeof(signal.to), peer);
+    if (link_.sendSignal(signal, remoteNode)) {
+      ++callSignalsSent_;
+    }
+  }
   LOG_I("call", "%s ended the call %s", userId, callId);
   sendStatus(200, "ended");
+}
+
+// ---------------------------------------------------------------------------
+// Real time calls - cross cell over the Wi-Fi backbone
+//
+// The signalling and the audio of a cross cell call go over the inter-station
+// IP link (lib/cell_link). No handler below ever hands anything to the mesh: a
+// call never enters the RS485 egress queue and no bus frame type was added.
+// ---------------------------------------------------------------------------
+
+// Outgoing invitation whose recipient lives in another cell.
+void AppServer::handleCallInviteRemote(const char* callId,
+                                       const char* from,
+                                       const char* to,
+                                       const RouteEntry& target) {
+  if (!link_.reachable(target.station)) {
+    sendStatus(409, "cell-unreachable",
+               "the station hosting the recipient is not reachable over the Wi-Fi backbone");
+    return;
+  }
+  const CallStatus status = calls_.inviteRemote(callId, from, to, target.station, millis());
+  if (status != CallStatus::kOk) {
+    replyCallStatus(status);
+    return;
+  }
+  const CallSession* session = calls_.find(callId);
+  if (session == nullptr) {
+    sendStatus(500, "internal-error");
+    return;
+  }
+  if (!sendRemoteSignal(*session, kSignalInvite)) {
+    calls_.remoteEnd(callId, millis());
+    sendStatus(503, "link-unavailable", "the Wi-Fi backbone could not carry the invitation");
+    return;
+  }
+  ++callRemote_;
+  // The caller is told "dialing": the call is reported as ringing only once the
+  // remote station confirms that the recipient's phone really rings.
+  pushCallEvent(session->caller, "call_dialing", *session, nullptr, nullptr);
+  LOG_I("call", "%s invites %s (%s) in cell node %u over the Wi-Fi backbone", session->caller,
+        session->callee, session->callId, static_cast<unsigned>(session->remoteNode));
+
+  JsonDocument out;
+  out["status"] = "ringing";
+  out["callId"] = session->callId;
+  out["cell"] = config_.siteId;
+  out["to"] = session->callee;
+  out["remote"] = true;
+  out["route"] = siteNameForNode(target.station);
+  String text;
+  serializeJson(out, text);
+  sendJson(202, text);
+}
+
+bool AppServer::sendRemoteSignal(const CallSession& session, uint8_t action, uint8_t reason) {
+  if (session.remoteNode == 0U) {
+    return false;
+  }
+  LinkCallSignal signal;
+  copyField(signal.callId, sizeof(signal.callId), session.callId);
+  signal.action = action;
+  signal.reason = reason;
+  copyField(signal.from, sizeof(signal.from), session.caller);
+  copyField(signal.to, sizeof(signal.to), session.callee);
+  const bool sent = link_.sendSignal(signal, session.remoteNode);
+  if (sent) {
+    ++callSignalsSent_;
+  }
+  return sent;
+}
+
+const char* AppServer::localParticipant(const CallSession& session) const {
+  if (hasLocalSocket(session.caller)) {
+    return session.caller;
+  }
+  if (hasLocalSocket(session.callee)) {
+    return session.callee;
+  }
+  return nullptr;
+}
+
+// Ends a cross cell session and tells the other station, so both halves are
+// released at the same moment.
+void AppServer::releaseRemoteSession(const CallSession& session, uint8_t action, uint8_t reason) {
+  if (session.remoteNode == 0U) {
+    return;
+  }
+  sendRemoteSignal(session, action, reason);
 }
 
 // Diagnostic view of the call state of one user on this cell. Read only.
@@ -777,7 +965,29 @@ void AppServer::handleCallState() {
     call["from"] = session->caller;
     call["to"] = session->callee;
     call["role"] = strcmp(session->caller, userId) == 0 ? "caller" : "callee";
+    call["remote"] = session->remoteNode != 0U;
+    call["remoteNode"] = session->remoteNode;
+    call["remoteCell"] = session->remoteNode == 0U ? config_.siteId
+                                                   : siteNameForNode(session->remoteNode);
+    call["remoteConfirmed"] = session->remoteConfirmed;
   }
+  // Additive: the state of the Wi-Fi backbone as seen from this station.
+  JsonObject link = doc["link"].to<JsonObject>();
+  link["upstream"] = link_.routes().upstream();
+  link["upstreamReady"] = link_.upstreamReady();
+  link["upstreamConnected"] = link_.upstream().connected();
+  link["peers"] = link_.directMask();
+  JsonArray reachable = link["reachable"].to<JsonArray>();
+  for (uint8_t node = 1; node <= kCallMaxNodes; ++node) {
+    if (link_.reachable(node)) {
+      reachable.add(node);
+    }
+  }
+  link["signalsSent"] = callSignalsSent_;
+  link["signalsReceived"] = callSignalsReceived_;
+  link["audioForwarded"] = callAudioForwarded_;
+  link["audioFromLink"] = callAudioFromLink_;
+  link["remoteCalls"] = callRemote_;
   String out;
   serializeJson(doc, out);
   sendJson(200, out);
@@ -820,6 +1030,22 @@ void AppServer::handleCallAudio(uint8_t clientNumber, uint8_t* payload, size_t l
     ++callAudioRejected_;
     return;
   }
+
+  const uint8_t remoteNode = calls_.remoteNodeOf(callId);
+  if (remoteNode != 0U) {
+    // Cross cell call: the frame leaves this cell over the Wi-Fi backbone. It is
+    // never handed to the RS485 egress queue and no bus frame is created.
+    if (link_.sendAudio(payload, length, remoteNode)) {
+      calls_.noteMedia(callId, millis());
+      ++callAudioForwarded_;
+    } else {
+      // The backbone is down: the media watchdog closes the session shortly, and
+      // the audio is NOT rerouted on the bus.
+      ++callAudioSilent_;
+    }
+    return;
+  }
+
   size_t delivered = 0;
   for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; ++i) {
     if (i == clientNumber || socketUsers_[i][0] == '\0') {
@@ -842,24 +1068,207 @@ void AppServer::handleCallAudio(uint8_t clientNumber, uint8_t* payload, size_t l
 }
 
 // ---------------------------------------------------------------------------
+// Real time calls - reception from another cell
+//
+// The other station of a cross cell call hands us its signalling and its audio
+// here. Both stay inside this station from that point: the audio is delivered to
+// the local participant's WebSocket, exactly like a local call.
+// ---------------------------------------------------------------------------
+void AppServer::onLinkSignal(const LinkCallSignal& signal, uint8_t fromNode) {
+  ++callSignalsReceived_;
+  const uint32_t now = millis();
+  switch (signal.action) {
+    case kSignalInvite: {
+      // The callee is here, the caller is on `fromNode`.
+      const CallStatus status =
+          calls_.inviteIncoming(signal.callId, signal.from, signal.to, fromNode, now);
+      if (status != CallStatus::kOk) {
+        // The caller must not stay in "dialing" for ever: it is told why.
+        LinkCallSignal answer;
+        copyField(answer.callId, sizeof(answer.callId), signal.callId);
+        copyField(answer.from, sizeof(answer.from), signal.from);
+        copyField(answer.to, sizeof(answer.to), signal.to);
+        if (status == CallStatus::kBusy) {
+          answer.action = kSignalEnded;
+          answer.reason = static_cast<uint8_t>(CallEndReason::kBusy);
+        } else {
+          answer.action = kSignalReject;
+          answer.reason = static_cast<uint8_t>(CallEndReason::kUnavailable);
+        }
+        if (link_.sendSignal(answer, fromNode)) {
+          ++callSignalsSent_;
+        }
+        LOG_W("call", "cross cell invitation %s refused: %s", signal.callId,
+              callStatusName(status));
+        return;
+      }
+      const CallSession* session = calls_.find(signal.callId);
+      if (session == nullptr) {
+        return;
+      }
+      ++callRemote_;
+      // The recipient's phone rings here; the caller's station is confirmed.
+      pushCallEvent(session->callee, "call_invite", *session, nullptr, nullptr);
+      if (sendRemoteSignal(*session, kSignalRinging)) {
+        LOG_I("call", "incoming cross cell call %s from %s (node %u)", signal.callId, signal.from,
+              static_cast<unsigned>(fromNode));
+      }
+      return;
+    }
+
+    case kSignalRinging: {
+      if (calls_.noteRemoteRinging(signal.callId, now) != CallStatus::kOk) {
+        return;
+      }
+      const CallSession* session = calls_.find(signal.callId);
+      if (session == nullptr) {
+        return;
+      }
+      pushCallEvent(session->caller, "call_ringing", *session, nullptr, nullptr);
+      return;
+    }
+
+    case kSignalAccept: {
+      if (calls_.acceptRemote(signal.callId, now) != CallStatus::kOk) {
+        return;
+      }
+      const CallSession* session = calls_.find(signal.callId);
+      if (session == nullptr) {
+        return;
+      }
+      // The media path really exists now: the caller's application may open its
+      // microphone. A call is never reported as connected before this point.
+      pushCallEvent(session->caller, "call_accepted", *session, nullptr, nullptr);
+      LOG_I("call", "cross cell call %s established with node %u", signal.callId,
+            static_cast<unsigned>(fromNode));
+      return;
+    }
+
+    case kSignalReject:
+    case kSignalCancel:
+    case kSignalHangup:
+    case kSignalEnded: {
+      const CallSession* session = calls_.find(signal.callId);
+      if (session == nullptr) {
+        return;
+      }
+      const char* local = localParticipant(*session);
+      const char* peer =
+          (local != nullptr)
+              ? (strcmp(session->caller, local) == 0 ? session->callee : session->caller)
+              : nullptr;
+      char callId[kCallIdLength + 1] = {0};
+      copyField(callId, sizeof(callId), session->callId);
+      const char* reason = callEndReasonName(static_cast<CallEndReason>(signal.reason));
+      calls_.remoteEnd(signal.callId, now);
+      const char* event = (signal.action == kSignalReject)   ? "call_rejected"
+                          : (signal.action == kSignalCancel) ? "call_cancelled"
+                                                             : "call_ended";
+      if (local != nullptr) {
+        notifyCallEnded(local, callId, peer == nullptr ? "" : peer, event, reason);
+      }
+      LOG_I("call", "cross cell call %s ended by node %u (%s)", callId,
+            static_cast<unsigned>(fromNode), reason);
+      return;
+    }
+
+    default:
+      LOG_D("call", "unhandled cross cell signal action %u", static_cast<unsigned>(signal.action));
+      return;
+  }
+}
+
+void AppServer::onLinkAudio(uint8_t* audioFrame, size_t length, uint8_t fromNode) {
+  ++callAudioFromLink_;
+  char callId[kCallIdLength + 1] = {0};
+  uint16_t sequence = 0;
+  const uint8_t* media = nullptr;
+  size_t mediaLength = 0;
+  if (!parseCallAudioFrame(audioFrame, length, callId, sizeof(callId), sequence, &media,
+                           mediaLength)) {
+    ++callAudioRejected_;
+    return;
+  }
+  (void)media;
+  (void)mediaLength;
+  // The frame must belong to a cross cell session whose other station is exactly
+  // the one that sent it: a station cannot inject audio into another call.
+  if (calls_.remoteNodeOf(callId) != fromNode) {
+    ++callAudioRejected_;
+    return;
+  }
+  const CallSession* session = calls_.find(callId);
+  if (session == nullptr || session->state != CallState::kActive) {
+    ++callAudioRejected_;
+    return;
+  }
+  const char* local = localParticipant(*session);
+  if (local == nullptr) {
+    ++callAudioRejected_;
+    return;
+  }
+  // Same delivery path as a local call: the binary media frame goes to the local
+  // participant's WebSocket, unchanged.
+  size_t delivered = 0;
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; ++i) {
+    if (socketUsers_[i][0] == '\0') {
+      continue;
+    }
+    if (strcmp(socketUsers_[i], local) != 0) {
+      continue;
+    }
+    if (ws_.sendBIN(i, audioFrame, length)) {
+      ++delivered;
+    }
+  }
+  if (delivered == 0U) {
+    ++callAudioSilent_;
+    return;
+  }
+  calls_.noteMedia(callId, millis());
+  callAudioRelayed_ += static_cast<uint32_t>(delivered);
+}
+
+// ---------------------------------------------------------------------------
 // Real time calls - lifecycle helpers
 // ---------------------------------------------------------------------------
 void AppServer::serviceCallTimeouts() {
   const uint32_t now = millis();
-  char callId[kCallIdLength + 1] = {0};
-  // One expired invitation per call: bounded work, never a blocking loop.
-  while (calls_.expireRinging(now, callId, sizeof(callId))) {
-    LOG_I("call", "invitation %s expired without an answer", callId);
-    broadcastCallEvent("call_timeout", callId, "timeout");
+  // One expired session per call: bounded work, never a blocking loop.
+  CallSession expired;
+  while (calls_.expireRinging(now, expired)) {
+    LOG_I("call", "invitation %s expired without an answer", expired.callId);
+    broadcastCallEvent("call_timeout", expired.callId, "timeout");
+    if (expired.remoteNode != 0U) {
+      // The other station must release its half of the invitation too, otherwise
+      // its phone would ring for a call nobody is waiting for.
+      LinkCallSignal signal;
+      copyField(signal.callId, sizeof(signal.callId), expired.callId);
+      signal.action = kSignalCancel;
+      signal.reason = static_cast<uint8_t>(CallEndReason::kTimeout);
+      copyField(signal.from, sizeof(signal.from), expired.caller);
+      copyField(signal.to, sizeof(signal.to), expired.callee);
+      if (link_.sendSignal(signal, expired.remoteNode)) {
+        ++callSignalsSent_;
+      }
+    }
   }
-  char caller[kCallUserLength] = {0};
-  char callee[kCallUserLength] = {0};
-  while (calls_.expireStaleMedia(now, callId, sizeof(callId), caller, sizeof(caller), callee,
-                                 sizeof(callee))) {
-    LOG_W("call", "call %s dropped: no media for %lu ms", callId,
+  while (calls_.expireStaleMedia(now, expired)) {
+    LOG_W("call", "call %s dropped: no media for %lu ms", expired.callId,
           static_cast<unsigned long>(kCallMediaTimeoutMs));
-    notifyCallEnded(caller, callId, callee, "call_ended", "timeout");
-    notifyCallEnded(callee, callId, caller, "call_ended", "timeout");
+    notifyCallEnded(expired.caller, expired.callId, expired.callee, "call_ended", "timeout");
+    notifyCallEnded(expired.callee, expired.callId, expired.caller, "call_ended", "timeout");
+    if (expired.remoteNode != 0U) {
+      LinkCallSignal signal;
+      copyField(signal.callId, sizeof(signal.callId), expired.callId);
+      signal.action = kSignalEnded;
+      signal.reason = static_cast<uint8_t>(CallEndReason::kTimeout);
+      copyField(signal.from, sizeof(signal.from), expired.caller);
+      copyField(signal.to, sizeof(signal.to), expired.callee);
+      if (link_.sendSignal(signal, expired.remoteNode)) {
+        ++callSignalsSent_;
+      }
+    }
   }
 }
 
@@ -910,14 +1319,27 @@ void AppServer::broadcastCallEvent(const char* event, const char* callId, const 
 // Called when a socket closes: the session of that user is released and the
 // other participant is told, so no audio resource stays open.
 void AppServer::endCallsForUser(const char* userId, const char* event, const char* reason) {
-  char peer[kCallUserLength] = {0};
-  char callId[kCallIdLength + 1] = {0};
-  if (calls_.endForUser(userId, CallEndReason::kDisconnected, millis(), peer, sizeof(peer),
-                        callId, sizeof(callId)) != CallStatus::kOk) {
+  CallSession ended;
+  if (calls_.endForUser(userId, CallEndReason::kDisconnected, millis(), ended) !=
+      CallStatus::kOk) {
     return;
   }
-  LOG_I("call", "call %s released: %s left the cell", callId, userId);
-  notifyCallEnded(peer, callId, userId, event, reason);
+  const char* peer = (strcmp(ended.caller, userId) == 0) ? ended.callee : ended.caller;
+  LOG_I("call", "call %s released: %s left the cell", ended.callId, userId);
+  notifyCallEnded(peer, ended.callId, userId, event, reason);
+  if (ended.remoteNode != 0U) {
+    // The other cell must release its half: a cross cell call cannot outlive one
+    // of its participants.
+    LinkCallSignal signal;
+    copyField(signal.callId, sizeof(signal.callId), ended.callId);
+    signal.action = kSignalEnded;
+    signal.reason = static_cast<uint8_t>(CallEndReason::kDisconnected);
+    copyField(signal.from, sizeof(signal.from), ended.caller);
+    copyField(signal.to, sizeof(signal.to), ended.callee);
+    if (link_.sendSignal(signal, ended.remoteNode)) {
+      ++callSignalsSent_;
+    }
+  }
 }
 
 void AppServer::replyCallStatus(CallStatus status) {
@@ -929,8 +1351,11 @@ void AppServer::replyCallStatus(CallStatus status) {
       sendStatus(400, "self-call", "a user cannot call itself");
       return;
     case CallStatus::kNotLocal:
-      sendStatus(409, "cross-cell",
-                 "real time calls are restricted to users connected to this cell");
+      // The participant is not connected to *this* station. A cross cell call is
+      // routed over the Wi-Fi backbone before reaching the table, so getting here
+      // means the user really is absent.
+      sendStatus(409, "unavailable",
+                 "the participant is not connected to this station");
       return;
     case CallStatus::kUnknownUser:
       sendStatus(404, "unknown-user");

@@ -6,12 +6,16 @@
 #include "log.h"
 #include "mesh_node.h"
 #include "station_config.h"
+#include "station_link.h"
+#include "wifi_backbone.h"
 
 namespace {
 
 cell::LedIndicators gLeds;
 cell::MeshNode gMesh(Serial2, gLeds);
-cell::AppServer gServer(gMesh, cell::stationConfig());
+cell::WifiBackbone gWifi;
+cell::StationLink gLink(gWifi);
+cell::AppServer gServer(gMesh, gLink, cell::stationConfig());
 
 void onAppFrame(void* /*context*/, uint8_t type, const uint8_t* payload, size_t length) {
   gServer.onAppFrame(type, payload, length);
@@ -21,27 +25,15 @@ void onPresenceChanged(void* /*context*/) {
   gServer.onPresenceChanged();
 }
 
-void startAccessPoint() {
-  const cell::StationConfig& config = cell::stationConfig();
-  WiFi.mode(WIFI_AP);
+// Wi-Fi backbone callbacks. The link authenticates the stations and enforces the
+// hop limit; once a frame is accepted it is handed to the application server,
+// which treats it exactly like a local call from there on.
+void onLinkSignal(void* /*context*/, const cell::LinkCallSignal& signal, uint8_t fromNode) {
+  gServer.onLinkSignal(signal, fromNode);
+}
 
-  IPAddress address;
-  if (!address.fromString(config.apIp)) {
-    address = IPAddress(10, 0, 0, 1);
-  }
-  const IPAddress gateway = address;
-  const IPAddress mask(255, 255, 255, 0);
-  if (!WiFi.softAPConfig(address, gateway, mask)) {
-    LOG_W("wifi", "softAPConfig failed, default AP address will be used");
-  }
-
-  const bool started = WiFi.softAP(config.wifiSsid, config.wifiPassword, 1, false, 6);
-  if (started) {
-    LOG_I("wifi", "access point \"%s\" up, IP %s", config.wifiSsid,
-          WiFi.softAPIP().toString().c_str());
-  } else {
-    LOG_E("wifi", "access point \"%s\" failed to start", config.wifiSsid);
-  }
+void onLinkAudio(void* /*context*/, uint8_t* audioFrame, size_t length, uint8_t fromNode) {
+  gServer.onLinkAudio(audioFrame, length, fromNode);
 }
 
 }  // namespace
@@ -55,16 +47,31 @@ void setup() {
   LOG_I("boot", "local cellular prototype - %s - firmware %s", config.siteId,
         config.firmware);
 
-  startAccessPoint();
+  // Access point (unchanged) plus, for the stations that are not the hub, the
+  // station interface that attaches to the upstream access point.
+  gWifi.begin(config);
   gMesh.begin(config, onAppFrame, onPresenceChanged, nullptr);
+  gLink.begin(config, onLinkSignal, onLinkAudio, nullptr);
   gServer.begin();
 
-  LOG_I("boot", "ready: http://%s:%u/api/info", config.apIp,
-        static_cast<unsigned>(config.servicePort));
+  if (cell::stationUsesDemoLinkToken()) {
+    LOG_W("boot",
+          "the inter-station link token is still the DEMONSTRATION value from "
+          "platformio.ini: change it before any real deployment");
+  }
+
+  LOG_I("boot", "ready: http://%s:%u/api/info (calls: local + cross cell over the "
+                "Wi-Fi backbone)",
+        config.apIp, static_cast<unsigned>(config.servicePort));
 }
 
 void loop() {
+  const uint32_t now = millis();
   gServer.loop();
   gMesh.loop();
+  // The radio is serviced before the link so a lost association is noticed
+  // before the TCP sockets are inspected.
+  gWifi.loop(now);
+  gLink.loop(now);
   delay(1);
 }

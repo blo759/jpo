@@ -1,0 +1,9 @@
+{
+  "name": "cell_link",
+  "version": "1.0.0",
+  "keywords": ["esp32", "wifi", "backbone", "call"],
+  "description": "Inter-station IP link for CellNet: binary framing, hop limited routing and liveness for the Wi-Fi backbone that carries cross-cell call signalling and call audio. Deliberately independent from the RS485 bus protocol.",
+  "license": "MIT",
+  "platforms": ["espressif32", "native"],
+  "frameworks": "*"
+}

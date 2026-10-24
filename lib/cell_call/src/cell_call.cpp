@@ -65,7 +65,7 @@ const char* callStatusName(CallStatus status) {
   switch (status) {
     case CallStatus::kOk: return "ok";
     case CallStatus::kSelfCall: return "self-call";
-    case CallStatus::kNotLocal: return "cross-cell";
+    case CallStatus::kNotLocal: return "not-local";
     case CallStatus::kUnknownUser: return "unknown-user";
     case CallStatus::kUnavailable: return "unavailable";
     case CallStatus::kBusy: return "busy";
@@ -108,9 +108,10 @@ const char* callStateName(CallState state) {
 // ---------------------------------------------------------------------------
 // CallTable
 // ---------------------------------------------------------------------------
-void CallTable::begin(LocalUserProbe probe, void* context) {
+void CallTable::begin(LocalUserProbe probe, void* context, uint8_t selfNode) {
   probe_ = probe;
   probeContext_ = context;
+  selfNode_ = selfNode;
   clear();
 }
 
@@ -178,6 +179,8 @@ void CallTable::release(CallSession& session) {
   session.ringingSinceMs = 0;
   session.answeredAtMs = 0;
   session.lastMediaMs = 0;
+  session.remoteNode = 0;
+  session.remoteConfirmed = false;
 }
 
 void CallTable::refuse(CallStatus status) {
@@ -206,10 +209,42 @@ uint32_t CallTable::refusedCalls() const {
 // ---------------------------------------------------------------------------
 // Signalling
 // ---------------------------------------------------------------------------
-CallStatus CallTable::invite(const char* callId,
-                            const char* caller,
-                            const char* callee,
-                            uint32_t nowMs) {
+bool CallTable::cooldownExceeded(const char* caller, uint32_t nowMs) const {
+  for (size_t i = 0; i < kMaxCallSessions; ++i) {
+    if (stamps_[i].user[0] != '\0' && sameText(stamps_[i].user, caller) &&
+        static_cast<uint32_t>(nowMs - stamps_[i].atMs) < kCallInviteCooldownMs) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void CallTable::stampInvite(const char* caller, uint32_t nowMs) {
+  // Remember the invitation time in a slot that survives the release of the
+  // session itself.
+  size_t slot = 0;
+  for (size_t i = 0; i < kMaxCallSessions; ++i) {
+    if (sameText(stamps_[i].user, caller)) {
+      slot = i;
+      break;
+    }
+    if (stamps_[i].user[0] == '\0') {
+      slot = i;
+      break;
+    }
+    slot = i;
+  }
+  copyBounded(stamps_[slot].user, sizeof(stamps_[slot].user), caller);
+  stamps_[slot].atMs = nowMs;
+}
+
+CallStatus CallTable::create(const char* callId,
+                             const char* caller,
+                             const char* callee,
+                             uint8_t remoteNode,
+                             bool probeCaller,
+                             bool probeCallee,
+                             uint32_t nowMs) {
   if (!isValidCallId(callId)) {
     refuse(CallStatus::kInvalidCallId);
     return CallStatus::kInvalidCallId;
@@ -222,13 +257,20 @@ CallStatus CallTable::invite(const char* callId,
     refuse(CallStatus::kSelfCall);
     return CallStatus::kSelfCall;
   }
-  // The membership probe is the whole cellular isolation: a user of another
-  // station is not a local user here and can therefore never be called.
-  if (probe_ == nullptr || !probe_(probeContext_, caller)) {
+  // A remote session must name a different station: "remote on my own node" is a
+  // contradiction and would break the routing decision. A remoteNode of 0 is the
+  // normal local call and is always valid.
+  if (remoteNode != 0U && (remoteNode == selfNode_ || remoteNode > kCallMaxNodes)) {
+    refuse(CallStatus::kInvalidState);
+    return CallStatus::kInvalidState;
+  }
+  // The membership probe is what proves that a participant really is on this
+  // station: the identifier declared by a client is never trusted.
+  if (probeCaller && (probe_ == nullptr || !probe_(probeContext_, caller))) {
     refuse(CallStatus::kNotLocal);
     return CallStatus::kNotLocal;
   }
-  if (!probe_(probeContext_, callee)) {
+  if (probeCallee && (probe_ == nullptr || !probe_(probeContext_, callee))) {
     refuse(CallStatus::kNotLocal);
     return CallStatus::kNotLocal;
   }
@@ -236,18 +278,16 @@ CallStatus CallTable::invite(const char* callId,
     refuse(CallStatus::kBusy);
     return CallStatus::kBusy;
   }
-  if (isBusy(caller) || isBusy(callee)) {
+  // Only the participants present on this station can be busy here; a remote
+  // participant is checked by its own station when the signal arrives.
+  if ((probeCaller && isBusy(caller)) || (probeCallee && isBusy(callee))) {
     refuse(CallStatus::kBusy);
     return CallStatus::kBusy;
   }
-
   // Anti abuse: a caller cannot flood invitations.
-  for (size_t i = 0; i < kMaxCallSessions; ++i) {
-    if (stamps_[i].user[0] != '\0' && sameText(stamps_[i].user, caller) &&
-        static_cast<uint32_t>(nowMs - stamps_[i].atMs) < kCallInviteCooldownMs) {
-      refuse(CallStatus::kTooSoon);
-      return CallStatus::kTooSoon;
-    }
+  if (cooldownExceeded(caller, nowMs)) {
+    refuse(CallStatus::kTooSoon);
+    return CallStatus::kTooSoon;
   }
 
   CallSession* session = allocate();
@@ -263,25 +303,129 @@ CallStatus CallTable::invite(const char* callId,
   session->state = CallState::kRinging;
   session->ringingSinceMs = nowMs;
   session->lastMediaMs = nowMs;
-
-  // Remember the invitation time for the cooldown, in a slot that survives the
-  // release of the session itself.
-  size_t slot = 0;
-  for (size_t i = 0; i < kMaxCallSessions; ++i) {
-    if (sameText(stamps_[i].user, caller)) {
-      slot = i;
-      break;
-    }
-    if (stamps_[i].user[0] == '\0') {
-      slot = i;
-      break;
-    }
-    slot = i;
-  }
-  copyBounded(stamps_[slot].user, sizeof(stamps_[slot].user), caller);
-  stamps_[slot].atMs = nowMs;
-
+  session->remoteNode = remoteNode;
+  // A purely local session is confirmed by definition: there is no station in
+  // between that could fail to ring the callee.
+  session->remoteConfirmed = (remoteNode == 0U);
+  stampInvite(caller, nowMs);
   return CallStatus::kOk;
+}
+
+CallStatus CallTable::invite(const char* callId,
+                            const char* caller,
+                            const char* callee,
+                            uint32_t nowMs) {
+  // Local call: both participants must hold a socket on this station. This is
+  // the original behaviour and it is unchanged.
+  return create(callId, caller, callee, 0U, true, true, nowMs);
+}
+
+CallStatus CallTable::inviteRemote(const char* callId,
+                                   const char* caller,
+                                   const char* callee,
+                                   uint8_t remoteNode,
+                                   uint32_t nowMs) {
+  if (remoteNode == 0U) {
+    // No remote station: this is a local call, use the local path.
+    return invite(callId, caller, callee, nowMs);
+  }
+  return create(callId, caller, callee, remoteNode, true, false, nowMs);
+}
+
+CallStatus CallTable::inviteIncoming(const char* callId,
+                                     const char* remoteCaller,
+                                     const char* localCallee,
+                                     uint8_t remoteNode,
+                                     uint32_t nowMs) {
+  if (remoteNode == 0U) {
+    refuse(CallStatus::kInvalidState);
+    return CallStatus::kInvalidState;
+  }
+  // The caller lives on another station, the callee is here: only the callee is
+  // probed, and the session is born ringing on this side.
+  const CallStatus status =
+      create(callId, remoteCaller, localCallee, remoteNode, false, true, nowMs);
+  if (status != CallStatus::kOk) {
+    return status;
+  }
+  // On this side the callee's phone really rings now: there is no further
+  // station in between, so the invitation is confirmed by definition.
+  CallSession* session = findMutable(callId);
+  if (session != nullptr) {
+    session->remoteConfirmed = true;
+  }
+  return CallStatus::kOk;
+}
+
+CallStatus CallTable::noteRemoteRinging(const char* callId, uint32_t nowMs) {
+  CallSession* session = findMutable(callId);
+  if (session == nullptr) {
+    refuse(CallStatus::kUnknownCall);
+    return CallStatus::kUnknownCall;
+  }
+  if (session->state != CallState::kRinging) {
+    refuse(CallStatus::kInvalidState);
+    return CallStatus::kInvalidState;
+  }
+  if (static_cast<uint32_t>(nowMs - session->ringingSinceMs) > kCallRingTimeoutMs) {
+    release(*session);
+    refuse(CallStatus::kExpired);
+    return CallStatus::kExpired;
+  }
+  session->remoteConfirmed = true;
+  session->lastMediaMs = nowMs;
+  return CallStatus::kOk;
+}
+
+CallStatus CallTable::acceptRemote(const char* callId, uint32_t nowMs) {
+  CallSession* session = findMutable(callId);
+  if (session == nullptr) {
+    refuse(CallStatus::kUnknownCall);
+    return CallStatus::kUnknownCall;
+  }
+  if (session->remoteNode == 0U) {
+    // A local session is never accepted through the link.
+    refuse(CallStatus::kInvalidState);
+    return CallStatus::kInvalidState;
+  }
+  if (session->state != CallState::kRinging) {
+    refuse(CallStatus::kInvalidState);
+    return CallStatus::kInvalidState;
+  }
+  if (static_cast<uint32_t>(nowMs - session->ringingSinceMs) > kCallRingTimeoutMs) {
+    release(*session);
+    refuse(CallStatus::kExpired);
+    return CallStatus::kExpired;
+  }
+  session->state = CallState::kActive;
+  session->answeredAtMs = nowMs;
+  session->lastMediaMs = nowMs;
+  session->remoteConfirmed = true;
+  return CallStatus::kOk;
+}
+
+CallStatus CallTable::remoteEnd(const char* callId, uint32_t nowMs) {
+  (void)nowMs;
+  CallSession* session = findMutable(callId);
+  if (session == nullptr) {
+    // The remote side ended a call we no longer track: nothing to do, and this
+    // is not an error worth counting as a refusal.
+    return CallStatus::kOk;
+  }
+  if (session->state == CallState::kActive) {
+    ++completed_;
+  }
+  release(*session);
+  return CallStatus::kOk;
+}
+
+uint8_t CallTable::remoteNodeOf(const char* callId) const {
+  const CallSession* session = find(callId);
+  return session == nullptr ? 0U : session->remoteNode;
+}
+
+bool CallTable::isRemote(const char* callId) const {
+  return remoteNodeOf(callId) != 0U;
 }
 
 namespace {
@@ -398,29 +542,14 @@ CallStatus CallTable::hangup(const char* callId, const char* userId, uint32_t no
 CallStatus CallTable::endForUser(const char* userId,
                                  CallEndReason reason,
                                  uint32_t nowMs,
-                                 char* peerOut,
-                                 size_t peerCapacity,
-                                 char* callIdOut,
-                                 size_t callIdCapacity) {
+                                 CallSession& endedOut) {
   (void)nowMs;
   (void)reason;
-  if (peerOut != nullptr && peerCapacity > 0U) {
-    peerOut[0] = '\0';
-  }
-  if (callIdOut != nullptr && callIdCapacity > 0U) {
-    callIdOut[0] = '\0';
-  }
   CallSession* session = const_cast<CallSession*>(sessionOf(userId));
   if (session == nullptr) {
     return CallStatus::kUnknownCall;
   }
-  const char* peer = otherParty(*session, userId);
-  if (peerOut != nullptr && peerCapacity > 0U) {
-    copyBounded(peerOut, peerCapacity, peer);
-  }
-  if (callIdOut != nullptr && callIdCapacity > 0U) {
-    copyBounded(callIdOut, callIdCapacity, session->callId);
-  }
+  endedOut = *session;
   if (session->state == CallState::kActive) {
     ++completed_;
   }
@@ -428,10 +557,7 @@ CallStatus CallTable::endForUser(const char* userId,
   return CallStatus::kOk;
 }
 
-bool CallTable::expireRinging(uint32_t nowMs, char* callIdOut, size_t callIdCapacity) {
-  if (callIdOut != nullptr && callIdCapacity > 0U) {
-    callIdOut[0] = '\0';
-  }
+bool CallTable::expireRinging(uint32_t nowMs, CallSession& expiredOut) {
   for (size_t i = 0; i < kMaxCallSessions; ++i) {
     CallSession& session = sessions_[i];
     if (!session.used || session.state != CallState::kRinging) {
@@ -440,31 +566,14 @@ bool CallTable::expireRinging(uint32_t nowMs, char* callIdOut, size_t callIdCapa
     if (static_cast<uint32_t>(nowMs - session.ringingSinceMs) <= kCallRingTimeoutMs) {
       continue;
     }
-    if (callIdOut != nullptr && callIdCapacity > 0U) {
-      copyBounded(callIdOut, callIdCapacity, session.callId);
-    }
+    expiredOut = session;
     release(session);
     return true;
   }
   return false;
 }
 
-bool CallTable::expireStaleMedia(uint32_t nowMs,
-                                 char* callIdOut,
-                                 size_t callIdCapacity,
-                                 char* callerOut,
-                                 size_t callerCapacity,
-                                 char* calleeOut,
-                                 size_t calleeCapacity) {
-  if (callIdOut != nullptr && callIdCapacity > 0U) {
-    callIdOut[0] = '\0';
-  }
-  if (callerOut != nullptr && callerCapacity > 0U) {
-    callerOut[0] = '\0';
-  }
-  if (calleeOut != nullptr && calleeCapacity > 0U) {
-    calleeOut[0] = '\0';
-  }
+bool CallTable::expireStaleMedia(uint32_t nowMs, CallSession& expiredOut) {
   for (size_t i = 0; i < kMaxCallSessions; ++i) {
     CallSession& session = sessions_[i];
     if (!session.used || session.state != CallState::kActive) {
@@ -473,16 +582,7 @@ bool CallTable::expireStaleMedia(uint32_t nowMs,
     if (static_cast<uint32_t>(nowMs - session.lastMediaMs) <= kCallMediaTimeoutMs) {
       continue;
     }
-    if (callIdOut != nullptr && callIdCapacity > 0U) {
-      copyBounded(callIdOut, callIdCapacity, session.callId);
-    }
-    // Both participants are reported: the station notifies each of them.
-    if (callerOut != nullptr && callerCapacity > 0U) {
-      copyBounded(callerOut, callerCapacity, session.caller);
-    }
-    if (calleeOut != nullptr && calleeCapacity > 0U) {
-      copyBounded(calleeOut, calleeCapacity, session.callee);
-    }
+    expiredOut = session;
     ++completed_;
     release(session);
     return true;
