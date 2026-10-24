@@ -1256,8 +1256,8 @@ projet_jpo/
 │   ├── test_protocol.cpp           # 7 tests protocole
 │   ├── test_core.cpp               # 19 tests cœur (dont validation atomique du routage)
 │   ├── test_reliability.cpp        # 18 tests fiabilité + simulation 2 émetteurs
-│   ├── test_call.cpp               # 41 tests appels locaux et intercellulaires
-│   └── test_link.cpp               # 22 tests dorsale Wi-Fi + garde-fous « pas de RS485 »
+│   ├── test_call.cpp               # 38 tests appels locaux et intercellulaires
+│   └── test_link.cpp               # 21 tests dorsale Wi-Fi + garde-fous « pas de RS485 »
 ├── scripts/
 │   ├── native_toolchain.py         # MinGW fourni par PlatformIO pour env:native
 │   ├── flash_stations.ps1          # compile + téléverse les 3 cartes (mapping de ports)
@@ -1315,7 +1315,7 @@ validation atomique d'une table de présence tronquée et la simulation de deux
 émetteurs concurrents (livraison exactement une fois dans les deux sens, équité
 sous file pleine, récupération après perte de jeton, reprise après un pair muet).
 
-Les **appels** ajoutent 41 tests (`test/test_call.cpp`) : session à deux
+Les **appels** couvrent 38 tests (`test/test_call.cpp`) : session à deux
 participants, autorisation des appels locaux, sessions intercellulaires
 (invitation sortante et entrante, confirmation de sonnerie, acceptation, refus,
 fin, expiration, déconnexion, nœud contradictoire, utilisateur occupé), appel à
@@ -1326,7 +1326,7 @@ média (uniquement dans une session établie, uniquement entre les deux
 participants), codec de la trame binaire (aller‑retour et rejets) et les
 garde‑fous structurels décrits en 17.12.
 
-La **dorsale Wi‑Fi** ajoute 22 tests (`test/test_link.cpp`) : cadrage binaire et
+La **dorsale Wi‑Fi** couvre 21 tests (`test/test_link.cpp`) : cadrage binaire et
 ses rejets, réassemblage d'un flux TCP, authentification par jeton partagé
 (exactitude de la comparaison), charge utile de signalisation, routage en étoile
 pour les huit paires de cellules, convergence d'une topologie en chaîne,
@@ -1334,10 +1334,10 @@ anti‑boucle et limite de sauts, effacement des routes après une perte de liai
 politique de reconnexion, vivacité, et les cinq garde‑fous structurels qui
 interdisent toute dépendance de la dorsale au bus RS485.
 
-**Total : 103 tests natifs** (44 d'origine + 13 de fiabilisation + 41 d'appel +
-22 de dorsale, la répartition exacte étant visible dans `test_main.cpp`) et
-**71 tests JVM Android** (24 d'origine + 47 d'appel : protocole, tampon de gigue,
-garde cellulaire et appels intercellulaires autorisés).
+**Total : 103 tests natifs** (7 protocole + 19 cœur + 18 fiabilité = 44
+d'origine, + 38 appels + 21 dorsale) et **71 tests JVM Android** (24 d'origine +
+47 d'appel : protocole, tampon de gigue, garde cellulaire et appels
+intercellulaires autorisés).
 
 ---
 
