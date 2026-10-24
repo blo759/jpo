@@ -1,5 +1,7 @@
 #include "station_link.h"
 
+#include <lwip/sockets.h>
+
 #include <cstring>
 
 #include "log.h"
@@ -10,11 +12,23 @@ namespace {
 constexpr uint32_t kLinkHeartbeatMs = 5000;
 constexpr uint32_t kLinkRouteStateMs = 10000;
 constexpr uint32_t kLinkTimeoutMs = 15000;
-constexpr uint32_t kLinkConnectTimeoutMs = 400;
+// WiFiClient::connect() is synchronous and blocks in select() for the whole
+// timeout. It is therefore kept short: the RS485 receive buffer only holds about
+// 355 ms of bus traffic, so the main loop must never be stalled for longer.
+constexpr uint32_t kLinkConnectTimeoutMs = 200;
+// Progressive backoff of the reconnection attempts, capped so a station that
+// cannot reach its upstream still retries regularly.
+constexpr uint32_t kLinkMaxConnectDelayMs = 30000;
 // Bounded work per socket and per loop iteration: the main loop must keep
 // serving Wi-Fi, HTTP, WebSocket and the RS485 bus. One second of call audio is
 // 25 frames of 668 bytes, so this budget is far above the real arrival rate.
 constexpr size_t kLinkReadBudgetBytes = 6U * kLinkMaxFrameSize;
+
+// Call audio may be dropped when the socket is congested (a late audio frame is
+// useless); every other type is control traffic and must be queued.
+bool isControlFrame(uint8_t type) {
+  return type != kLinkCallAudio;
+}
 
 }  // namespace
 
@@ -92,6 +106,8 @@ void StationLink::closeSlot(Socket& slot, const char* reason) {
   slot.authenticated = false;
   slot.node = 0;
   slot.assembler.reset();
+  slot.control.clear();
+  slot.audio.clear();
   ++disconnects_;
 }
 
@@ -118,6 +134,8 @@ void StationLink::acceptConnections(uint32_t nowMs) {
   slot->authenticated = false;
   slot->node = 0;
   slot->assembler.reset();
+  slot->control.clear();
+  slot->audio.clear();
   slot->liveness.begin(nowMs);
   LOG_I("link", "incoming link connection from %s, waiting for the hello",
         slot->client.remoteIP().toString().c_str());
@@ -151,6 +169,13 @@ void StationLink::serviceUpstream(uint32_t nowMs) {
     LOG_W("link", "upstream %s:%u unreachable", config_->upstreamIp,
           static_cast<unsigned>(config_->linkPort));
     slot.client.stop();
+    // Progressive backoff: the connect() call is synchronous, so a station that
+    // cannot reach its upstream must not retry it every two seconds for ever.
+    connectDelayMs_ = (connectDelayMs_ == 0U) ? config_->linkRetryMs : connectDelayMs_ * 2U;
+    if (connectDelayMs_ > kLinkMaxConnectDelayMs) {
+      connectDelayMs_ = kLinkMaxConnectDelayMs;
+    }
+    upstream_.setRetryDelay(connectDelayMs_);
     return;
   }
   slot.client.setNoDelay(true);
@@ -160,7 +185,12 @@ void StationLink::serviceUpstream(uint32_t nowMs) {
   slot.authenticated = false;
   slot.node = 0;
   slot.assembler.reset();
+  slot.control.clear();
+  slot.audio.clear();
   slot.liveness.begin(nowMs);
+  // The upstream answered: the backoff starts over.
+  connectDelayMs_ = 0;
+  upstream_.setRetryDelay(config_->linkRetryMs);
 
   uint8_t payload[kLinkHelloPayloadSize] = {0};
   const size_t payloadLength =
@@ -176,8 +206,8 @@ void StationLink::serviceUpstream(uint32_t nowMs) {
   hello.hops = 0;
   memcpy(hello.payload, payload, payloadLength);
   hello.payloadLength = static_cast<uint16_t>(payloadLength);
-  if (!sendFrame(slot, hello)) {
-    closeSlot(slot, "hello write failed");
+  if (!enqueueFrame(slot, hello, true)) {
+    closeSlot(slot, "hello queue full");
     return;
   }
   LOG_I("link", "hello sent to node %u, waiting for the acknowledgement",
@@ -195,7 +225,7 @@ void StationLink::sendRouteState(Socket& slot) {
   state.hops = 0;
   state.payload[0] = routes_.reachableMask();
   state.payloadLength = static_cast<uint16_t>(kLinkRouteStatePayloadSize);
-  sendFrame(slot, state);
+  enqueueFrame(slot, state, true);
 }
 
 void StationLink::sendHeartbeats(uint32_t nowMs) {
@@ -222,24 +252,62 @@ void StationLink::sendHeartbeats(uint32_t nowMs) {
     beat.srcNode = config_->nodeId;
     beat.dstNode = slot.node;
     beat.hops = 0;
-    if (!sendFrame(slot, beat)) {
-      closeSlot(slot, "heartbeat write failed");
+    if (!enqueueFrame(slot, beat, true)) {
+      closeSlot(slot, "heartbeat queue full");
     }
   }
 }
 
-bool StationLink::sendFrame(Socket& slot, LinkFrame& frame) {
+// One non blocking write. MSG_DONTWAIT never waits, so a congested socket cannot
+// stall the main loop: the caller is the loop that also has to drain the RS485
+// UART before its buffer overflows.
+size_t StationLink::writeSocket(void* context, const uint8_t* data, size_t length) {
+  WiFiClient* client = static_cast<WiFiClient*>(context);
+  if (client == nullptr || data == nullptr || length == 0U) {
+    return 0U;
+  }
+  const int fd = client->fd();
+  if (fd < 0) {
+    return 0U;
+  }
+  const int written = send(fd, data, length, MSG_DONTWAIT);
+  if (written <= 0) {
+    return 0U;
+  }
+  return static_cast<size_t>(written);
+}
+
+// Drains at most one slice of each ring. The control ring is served first so a
+// call signal is never delayed behind call audio.
+void StationLink::flushSocket(Socket& slot) {
+  if (!slot.active) {
+    return;
+  }
+  if (!slot.control.empty()) {
+    slot.control.flush(&StationLink::writeSocket, &slot.client);
+  }
+  if (!slot.audio.empty()) {
+    slot.audio.flush(&StationLink::writeSocket, &slot.client);
+  }
+}
+
+bool StationLink::enqueueFrame(Socket& slot, LinkFrame& frame, bool control) {
   if (!slot.active || !slot.client.connected()) {
     return false;
   }
-  uint8_t encoded[kLinkMaxFrameSize] = {0};
+  uint8_t encoded[kLinkMaxFrameSize];
   const size_t length = encodeLinkFrame(frame, encoded, sizeof(encoded));
   if (length == 0U) {
     return false;
   }
-  const size_t written = slot.client.write(encoded, length);
-  if (written != length) {
-    return false;
+  LinkTxBuffer& target = control ? slot.control : slot.audio;
+  if (target.push(encoded, length) == 0U) {
+    // The ring is full: try to free it immediately, then give up. Nothing is
+    // ever written partially, so the peer stream stays valid.
+    flushSocket(slot);
+    if (target.push(encoded, length) == 0U) {
+      return false;
+    }
   }
   ++framesSent_;
   return true;
@@ -257,6 +325,9 @@ void StationLink::serviceSocket(Socket& slot, uint32_t nowMs) {
     return;
   }
   uint8_t chunk[512] = {0};
+  // Declared once: a LinkFrame is ~720 bytes and value initialised, so building
+  // one per received byte would burn a lot of time in the main loop.
+  LinkFrame frame;
   size_t budget = kLinkReadBudgetBytes;
   while (budget > 0U && slot.client.available() > 0) {
     const size_t want = (budget < sizeof(chunk)) ? budget : sizeof(chunk);
@@ -268,7 +339,6 @@ void StationLink::serviceSocket(Socket& slot, uint32_t nowMs) {
     // Bytes really arrived: the peer is alive, whatever the frame contains.
     slot.liveness.noteActivity(nowMs);
     for (int i = 0; i < got; ++i) {
-      LinkFrame frame;
       if (slot.assembler.push(chunk[i], frame) == LinkStreamAssembler::Status::kFrameReady) {
         handleFrame(slot, frame, nowMs);
         if (!slot.active) {
@@ -277,6 +347,8 @@ void StationLink::serviceSocket(Socket& slot, uint32_t nowMs) {
       }
     }
   }
+  // Outbound: at most one non blocking slice per ring, so this can never block.
+  flushSocket(slot);
   if (slot.active && slot.authenticated && slot.liveness.stale(nowMs, kLinkTimeoutMs)) {
     LOG_W("link", "node %u silent for %lu ms, closing the link", static_cast<unsigned>(slot.node),
           static_cast<unsigned long>(kLinkTimeoutMs));
@@ -315,7 +387,9 @@ void StationLink::handleFrame(Socket& slot, LinkFrame& frame, uint32_t nowMs) {
       reject.srcNode = config_->nodeId;
       reject.dstNode = nodeId;
       reject.hops = 0;
-      sendFrame(slot, reject);
+      enqueueFrame(slot, reject, true);
+      // Give the refusal a chance to leave before the socket is closed.
+      flushSocket(slot);
       closeSlot(slot, "authentication failed");
       return;
     }
@@ -338,7 +412,7 @@ void StationLink::handleFrame(Socket& slot, LinkFrame& frame, uint32_t nowMs) {
     ack.srcNode = config_->nodeId;
     ack.dstNode = nodeId;
     ack.hops = 0;
-    sendFrame(slot, ack);
+    enqueueFrame(slot, ack, true);
     LOG_I("link", "node %u authenticated from %s", static_cast<unsigned>(nodeId),
           slot.client.remoteIP().toString().c_str());
     // The new peer immediately learns what this station can reach.
@@ -447,7 +521,7 @@ void StationLink::relayFrame(Socket& incoming, LinkFrame& frame) {
   if (frame.hops < 255U) {
     ++frame.hops;
   }
-  if (!sendFrame(*next, frame)) {
+  if (!enqueueFrame(*next, frame, isControlFrame(frame.type))) {
     ++framesDropped_;
     return;
   }
@@ -484,7 +558,7 @@ bool StationLink::sendSignal(const LinkCallSignal& signal, uint8_t dstNode) {
   frame.hops = 0;
   memcpy(frame.payload, payload, length);
   frame.payloadLength = static_cast<uint16_t>(length);
-  if (!sendFrame(*slot, frame)) {
+  if (!enqueueFrame(*slot, frame, true)) {
     ++framesDropped_;
     return false;
   }
@@ -514,7 +588,7 @@ bool StationLink::sendAudio(const uint8_t* audioFrame, size_t length, uint8_t ds
   frame.hops = 0;
   memcpy(frame.payload, audioFrame, length);
   frame.payloadLength = static_cast<uint16_t>(length);
-  if (!sendFrame(*slot, frame)) {
+  if (!enqueueFrame(*slot, frame, false)) {
     ++framesDropped_;
     return false;
   }
@@ -529,12 +603,26 @@ void StationLink::loop(uint32_t nowMs) {
   if (config_ == nullptr) {
     return;
   }
+  const uint32_t startUs = micros();
   acceptConnections(nowMs);
   serviceUpstream(nowMs);
   for (size_t i = 0; i < kSocketSlots; ++i) {
     serviceSocket(sockets_[i], nowMs);
   }
   sendHeartbeats(nowMs);
+  const uint32_t elapsedUs = micros() - startUs;
+  if (elapsedUs > maxLoopUs_) {
+    maxLoopUs_ = elapsedUs;
+  }
+}
+
+size_t StationLink::txPending() const {
+  size_t pending = 0;
+  for (size_t i = 0; i < kSocketSlots; ++i) {
+    pending += sockets_[i].control.size();
+    pending += sockets_[i].audio.size();
+  }
+  return pending;
 }
 
 bool StationLink::reachable(uint8_t node) const {

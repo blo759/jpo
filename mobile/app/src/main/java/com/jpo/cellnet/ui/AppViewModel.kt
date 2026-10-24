@@ -406,7 +406,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val profile = _state.value.profile ?: return
         val detected = detectCell() ?: return
         if (!socket.isConnected()) {
-            socket.connect("ws://${detected.ip}:${detected.cell.wsPort}", profile.userId)
+            // The display name travels with the stable identifier: the station that
+            // receives this user for the first time must not fall back to the raw
+            // id, otherwise a cell change would rename the user everywhere.
+            socket.connect(
+                "ws://${detected.ip}:${detected.cell.wsPort}",
+                profile.userId,
+                profile.displayName
+            )
         }
         // A real cell change (A -> C) re-registers the user on the new station and
         // resumes the interrupted transfers there. The identity, the conversations

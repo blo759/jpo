@@ -34,13 +34,14 @@ class CellSocket(private val listener: Listener) {
 
     fun isConnected(): Boolean = connected
 
-    fun connect(url: String, userId: String) {
+    fun connect(url: String, userId: String, displayName: String = userId) {
         disconnect()
         val request = Request.Builder().url(url).build()
+        val hello = HelloMessage.build(userId, displayName)
         socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 connected = true
-                webSocket.send("{\"type\":\"hello\",\"userId\":\"$userId\"}")
+                webSocket.send(hello)
                 listener.onSocketOpen()
             }
 

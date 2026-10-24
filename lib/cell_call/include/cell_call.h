@@ -158,8 +158,11 @@ class CallTable {
   CallStatus noteRemoteRinging(const char* callId, uint32_t nowMs);
   // The remote callee accepted the invitation.
   CallStatus acceptRemote(const char* callId, uint32_t nowMs);
-  // The remote side refused, cancelled or ended the call.
-  CallStatus remoteEnd(const char* callId, uint32_t nowMs);
+  // The remote side refused, cancelled or ended the call. `endedOut` receives a
+  // COPY of the released session: the caller must notify the local participant
+  // *after* the release, and the session fields are cleared by then, so reading
+  // them through a pointer into the table would silently notify nobody.
+  CallStatus remoteEnd(const char* callId, uint32_t nowMs, CallSession& endedOut);
 
   /** Station hosting the remote participant, or 0 when both are local. */
   uint8_t remoteNodeOf(const char* callId) const;

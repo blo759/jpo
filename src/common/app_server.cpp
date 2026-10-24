@@ -220,7 +220,8 @@ void AppServer::handleSocketEvent(uint8_t clientNumber,
         return;
       }
       const char* userId = doc["userId"] | "";
-      bindSocketToUser(clientNumber, userId);
+      const char* displayName = doc["displayName"] | "";
+      bindSocketToUser(clientNumber, userId, displayName);
       if (socketUsers_[clientNumber][0] == '\0') {
         return;
       }
@@ -249,7 +250,9 @@ void AppServer::handleSocketEvent(uint8_t clientNumber,
   }
 }
 
-void AppServer::bindSocketToUser(uint8_t clientNumber, const char* userId) {
+void AppServer::bindSocketToUser(uint8_t clientNumber,
+                                 const char* userId,
+                                 const char* displayName) {
   if (userId == nullptr || userId[0] == '\0' || strlen(userId) >= kMaxUserIdLength) {
     socketUsers_[clientNumber][0] = '\0';
     LOG_W("ws", "invalid user id on socket %u", static_cast<unsigned>(clientNumber));
@@ -257,11 +260,23 @@ void AppServer::bindSocketToUser(uint8_t clientNumber, const char* userId) {
   }
   memset(socketUsers_[clientNumber], 0, kMaxUserIdLength);
   strncpy(socketUsers_[clientNumber], userId, kMaxUserIdLength - 1U);
-  if (!mesh_.refreshLocalUser(socketUsers_[clientNumber])) {
-    mesh_.registerLocalUser(socketUsers_[clientNumber], socketUsers_[clientNumber]);
+  // The identity of a user is its identifier, never its name, its address or the
+  // cell it is attached to. Joining a new cell therefore only refreshes the
+  // presence entry: no new user is ever created.
+  //
+  // The display name comes from the client. Without it, a user that moves to
+  // another cell would be registered under its raw identifier and every cell
+  // would then display "u-3f2a1b9c0d" instead of the announced name. The
+  // identifier is only kept as a last resort for an older client.
+  const char* name =
+      (displayName != nullptr && displayName[0] != '\0') ? displayName : socketUsers_[clientNumber];
+  mesh_.refreshLocalUser(socketUsers_[clientNumber]);
+  if (!mesh_.registerLocalUser(socketUsers_[clientNumber], name)) {
+    LOG_W("ws", "cannot register user %s on this station (presence table full?)",
+          socketUsers_[clientNumber]);
   }
-  LOG_I("ws", "socket %u bound to user %s", static_cast<unsigned>(clientNumber),
-        socketUsers_[clientNumber]);
+  LOG_I("ws", "socket %u bound to user %s (%s)", static_cast<unsigned>(clientNumber),
+        socketUsers_[clientNumber], name);
 }
 
 void AppServer::pushToUser(const char* userId, const String& json) {
@@ -533,6 +548,12 @@ void AppServer::handleHealth() {
   link["audioReceived"] = link_.audioReceived();
   link["authRejections"] = link_.authRejections();
   link["disconnects"] = link_.disconnects();
+  // Diagnosis of the two things that can starve the RS485 bus: how much the
+  // backbone still has to write, and how long the link servicing blocked the
+  // main loop. Both must stay small; a growing txPending means a congested
+  // backbone, a large maxLoopUs means the bus receive buffer was at risk.
+  link["txPending"] = static_cast<uint32_t>(link_.txPending());
+  link["maxLoopUs"] = link_.maxLoopUs();
   link["transport"] = "tcp-wifi-backbone";
 
   String out;
@@ -875,7 +896,8 @@ void AppServer::handleCallInviteRemote(const char* callId,
     return;
   }
   if (!sendRemoteSignal(*session, kSignalInvite)) {
-    calls_.remoteEnd(callId, millis());
+    CallSession dropped;
+    calls_.remoteEnd(callId, millis(), dropped);
     sendStatus(503, "link-unavailable", "the Wi-Fi backbone could not carry the invitation");
     return;
   }
@@ -988,6 +1010,8 @@ void AppServer::handleCallState() {
   link["audioForwarded"] = callAudioForwarded_;
   link["audioFromLink"] = callAudioFromLink_;
   link["remoteCalls"] = callRemote_;
+  link["txPending"] = static_cast<uint32_t>(link_.txPending());
+  link["maxLoopUs"] = link_.maxLoopUs();
   String out;
   serializeJson(doc, out);
   sendJson(200, out);
@@ -1148,26 +1172,27 @@ void AppServer::onLinkSignal(const LinkCallSignal& signal, uint8_t fromNode) {
     case kSignalCancel:
     case kSignalHangup:
     case kSignalEnded: {
-      const CallSession* session = calls_.find(signal.callId);
-      if (session == nullptr) {
+      // `remoteEnd` returns a copy of the released session: the local
+      // participant must be notified AFTER the release, and the session fields
+      // are cleared by then. Reading them through a pointer into the table would
+      // notify nobody at all, which is exactly why the remote side kept ringing.
+      CallSession ended;
+      if (calls_.remoteEnd(signal.callId, now, ended) != CallStatus::kOk) {
         return;
       }
-      const char* local = localParticipant(*session);
-      const char* peer =
-          (local != nullptr)
-              ? (strcmp(session->caller, local) == 0 ? session->callee : session->caller)
-              : nullptr;
-      char callId[kCallIdLength + 1] = {0};
-      copyField(callId, sizeof(callId), session->callId);
+      if (ended.callId[0] == '\0') {
+        return;  // this station no longer tracks that call
+      }
+      const char* local = localParticipant(ended);
       const char* reason = callEndReasonName(static_cast<CallEndReason>(signal.reason));
-      calls_.remoteEnd(signal.callId, now);
       const char* event = (signal.action == kSignalReject)   ? "call_rejected"
                           : (signal.action == kSignalCancel) ? "call_cancelled"
                                                              : "call_ended";
       if (local != nullptr) {
-        notifyCallEnded(local, callId, peer == nullptr ? "" : peer, event, reason);
+        const char* peer = (strcmp(ended.caller, local) == 0) ? ended.callee : ended.caller;
+        notifyCallEnded(local, ended.callId, peer, event, reason);
       }
-      LOG_I("call", "cross cell call %s ended by node %u (%s)", callId,
+      LOG_I("call", "cross cell call %s ended by node %u (%s)", ended.callId,
             static_cast<unsigned>(fromNode), reason);
       return;
     }

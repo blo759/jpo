@@ -33,6 +33,13 @@ constexpr size_t kLinkHeaderSize = 12;
 // signalling payloads.
 constexpr size_t kLinkMaxPayload = 704;
 constexpr size_t kLinkMaxFrameSize = kLinkHeaderSize + kLinkMaxPayload;
+// Outbound buffer of one link socket. One audio frame is 668 bytes, so 2 kB
+// absorbs a short congestion without ever dropping a call signal.
+constexpr size_t kLinkTxBufferSize = 2048;
+// A call signal is tiny and must never be blocked by a burst of call audio:
+// the two kinds of frame have their own ring, exactly like the bus control and
+// application rings.
+constexpr size_t kLinkTxControlSize = 256;
 constexpr size_t kLinkTokenLength = 24;
 constexpr size_t kLinkUserLength = 24;
 constexpr size_t kLinkCallIdLength = 8;
@@ -226,6 +233,49 @@ class LinkRoutes {
 };
 
 // ---------------------------------------------------------------------------
+// Non blocking outbound buffer
+// ---------------------------------------------------------------------------
+// A TCP socket must never be written with the library write(): on ESP32 it
+// retries up to 10 times with a 1 second select() each, so a congested link can
+// stall the caller for seconds. That is fatal here, because the caller is the
+// main loop, which also has to drain the RS485 UART before its buffer overflows.
+//
+// This buffer therefore holds whole frames and is drained by the caller with at
+// most one non blocking write per loop. The byte order is preserved and a
+// partially written frame is never discarded, so the peer stream stays valid
+// even when the socket only accepts part of a frame.
+class LinkTxBuffer {
+ public:
+  // `storage` must outlive the buffer.
+  LinkTxBuffer(uint8_t* storage, size_t capacity);
+
+  // Returns the number of bytes accepted, or 0 when the buffer is full.
+  size_t push(const uint8_t* bytes, size_t count);
+
+  // Platform neutral: the caller performs the actual write.
+  // Must return the number of bytes written, 0 when nothing could be written.
+  using WriteFn = size_t (*)(void* context, const uint8_t* data, size_t length);
+
+  // Writes at most one slice. Returns the number of bytes written.
+  size_t flush(WriteFn write, void* context);
+
+  void clear();
+  bool empty() const { return length_ == 0U; }
+  size_t size() const { return length_ - sent_; }
+  size_t capacity() const { return capacity_; }
+  uint32_t rejected() const { return rejected_; }
+
+ private:
+  void compact();
+
+  uint8_t* data_ = nullptr;
+  size_t capacity_ = 0;
+  size_t length_ = 0;
+  size_t sent_ = 0;
+  uint32_t rejected_ = 0;
+};
+
+// ---------------------------------------------------------------------------
 // Link health
 // ---------------------------------------------------------------------------
 // Client side reconnection policy of a leaf station (the station that opens the
@@ -238,6 +288,8 @@ class LinkClientState {
   bool shouldAttempt(uint32_t nowMs) const;
   /** Records that a connection attempt was started at `nowMs`. */
   void noteAttempt(uint32_t nowMs);
+  /** Replaces the delay used by the next onDisconnected() (progressive backoff). */
+  void setRetryDelay(uint32_t retryMs);
   bool connected() const { return connected_; }
   uint32_t attempts() const { return attempts_; }
   uint32_t reconnects() const { return reconnects_; }

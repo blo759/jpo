@@ -567,3 +567,215 @@ void testTheRecordedVoicePathIsUntouchedByTheBackbone() {
   // by the first byte of the binary WebSocket payload.
   TEST_ASSERT_TRUE(contains(server, "payload[0] == kVoiceBinaryMagic"));
 }
+
+// ---------------------------------------------------------------------------
+// Non blocking outbound buffer.
+//
+// Regression: the ESP32 WiFiClient::write() retries up to 10 times with a one
+// second select() each. A congested backbone could therefore stall the main loop
+// for seconds, and while the loop is stalled the RS485 receive buffer overflows:
+// text messages, recorded voice blocks and their acknowledgements were lost.
+// The link must never call that write, and its own buffer must always preserve
+// the byte stream.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct FakeSocket {
+  std::string written;
+  size_t acceptPerCall = 0;  // bytes accepted per call when `unlimited` is false
+  bool unlimited = true;     // by default the socket accepts everything offered
+  size_t calls = 0;
+};
+
+size_t fakeWrite(void* context, const uint8_t* data, size_t length) {
+  FakeSocket* socket = static_cast<FakeSocket*>(context);
+  ++socket->calls;
+  size_t room = socket->unlimited ? length : socket->acceptPerCall;
+  if (room > length) {
+    room = length;
+  }
+  socket->written.append(reinterpret_cast<const char*>(data), room);
+  return room;
+}
+
+}  // namespace
+
+void testLinkTxBufferKeepsTheFrameOrder() {
+  uint8_t storage[64] = {0};
+  cell::LinkTxBuffer buffer(storage, sizeof(storage));
+  FakeSocket socket;
+
+  TEST_ASSERT_EQUAL_UINT32(
+      3U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("AAA"), 3U)));
+  TEST_ASSERT_EQUAL_UINT32(
+      3U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("BBB"), 3U)));
+  TEST_ASSERT_EQUAL_UINT32(6U, static_cast<uint32_t>(buffer.size()));
+
+  TEST_ASSERT_EQUAL_UINT32(6U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_EQUAL_STRING("AAABBB", socket.written.c_str());
+  TEST_ASSERT_TRUE(buffer.empty());
+  // Nothing left to write: a flush on an empty buffer must not touch the socket.
+  TEST_ASSERT_EQUAL_UINT32(0U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_EQUAL_UINT32(1U, static_cast<uint32_t>(socket.calls));
+}
+
+void testLinkTxBufferRetriesTheRestOfAFrameWhenTheSocketIsBusy() {
+  uint8_t storage[64] = {0};
+  cell::LinkTxBuffer buffer(storage, sizeof(storage));
+  FakeSocket socket;
+
+  TEST_ASSERT_EQUAL_UINT32(
+      10U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("0123456789"), 10U)));
+
+  // The socket only accepts 4 bytes: the rest must stay buffered, in order, and
+  // the peer must never see a truncated frame.
+  socket.unlimited = false;
+  socket.acceptPerCall = 4U;
+  TEST_ASSERT_EQUAL_UINT32(4U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_EQUAL_STRING("0123", socket.written.c_str());
+  TEST_ASSERT_FALSE(buffer.empty());
+  TEST_ASSERT_EQUAL_UINT32(6U, static_cast<uint32_t>(buffer.size()));
+
+  // Nothing can be written at all: the buffer must not lose anything.
+  socket.acceptPerCall = 0U;
+  socket.written.clear();
+  TEST_ASSERT_EQUAL_UINT32(0U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_TRUE(socket.written.empty());
+  TEST_ASSERT_EQUAL_UINT32(6U, static_cast<uint32_t>(buffer.size()));
+
+  // The socket drains: the remainder leaves in the original order.
+  socket.unlimited = true;
+  socket.written.clear();
+  TEST_ASSERT_EQUAL_UINT32(6U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_EQUAL_STRING("456789", socket.written.c_str());
+  TEST_ASSERT_TRUE(buffer.empty());
+}
+
+void testLinkTxBufferIsBoundedAndCountsRejections() {
+  uint8_t storage[8] = {0};
+  cell::LinkTxBuffer buffer(storage, sizeof(storage));
+
+  TEST_ASSERT_EQUAL_UINT32(
+      8U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("12345678"), 8U)));
+  // A full buffer must refuse, not truncate and not overflow.
+  TEST_ASSERT_EQUAL_UINT32(
+      0U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("9"), 1U)));
+  TEST_ASSERT_EQUAL_UINT32(1U, buffer.rejected());
+  TEST_ASSERT_EQUAL_UINT32(8U, static_cast<uint32_t>(buffer.size()));
+
+  FakeSocket socket;
+  TEST_ASSERT_EQUAL_UINT32(8U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_TRUE(buffer.empty());
+  // Room is available again.
+  TEST_ASSERT_EQUAL_UINT32(
+      1U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("9"), 1U)));
+}
+
+void testLinkTxBufferReclaimsTheBytesAlreadyWritten() {
+  uint8_t storage[8] = {0};
+  cell::LinkTxBuffer buffer(storage, sizeof(storage));
+  FakeSocket socket;
+
+  TEST_ASSERT_EQUAL_UINT32(
+      8U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("ABCDEFGH"), 8U)));
+  socket.unlimited = false;
+  socket.acceptPerCall = 4U;
+  TEST_ASSERT_EQUAL_UINT32(4U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_EQUAL_UINT32(4U, static_cast<uint32_t>(buffer.size()));
+
+  // The four bytes already written must be reclaimed, otherwise the ring would
+  // appear full while half of it is dead space.
+  TEST_ASSERT_EQUAL_UINT32(
+      4U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("IJKL"), 4U)));
+  socket.unlimited = true;
+  TEST_ASSERT_EQUAL_UINT32(8U, static_cast<uint32_t>(buffer.flush(fakeWrite, &socket)));
+  TEST_ASSERT_EQUAL_STRING("ABCDEFGHIJKL", socket.written.c_str());
+  TEST_ASSERT_TRUE(buffer.empty());
+}
+
+void testLinkTxBufferIgnoresDegenerateInput() {
+  uint8_t storage[16] = {0};
+  cell::LinkTxBuffer buffer(storage, sizeof(storage));
+  FakeSocket socket;
+
+  TEST_ASSERT_EQUAL_UINT32(0U, static_cast<uint32_t>(buffer.push(nullptr, 4U)));
+  TEST_ASSERT_EQUAL_UINT32(
+      0U, static_cast<uint32_t>(buffer.push(reinterpret_cast<const uint8_t*>("x"), 0U)));
+  TEST_ASSERT_EQUAL_UINT32(0U, static_cast<uint32_t>(buffer.flush(nullptr, &socket)));
+  TEST_ASSERT_EQUAL_UINT32(0U, static_cast<uint32_t>(buffer.flush(fakeWrite, nullptr)));
+  TEST_ASSERT_EQUAL_UINT32(0U, buffer.rejected());
+  TEST_ASSERT_TRUE(buffer.empty());
+
+  // A zero capacity buffer must refuse everything instead of corrupting memory.
+  cell::LinkTxBuffer empty(nullptr, 0U);
+  TEST_ASSERT_EQUAL_UINT32(
+      0U, static_cast<uint32_t>(empty.push(reinterpret_cast<const uint8_t*>("x"), 1U)));
+  TEST_ASSERT_TRUE(empty.empty());
+}
+
+void testLinkTxBufferSeparatesControlFromAudio() {
+  // A burst of call audio must never be able to push out a call signal: the two
+  // traffic classes have their own ring, exactly like the bus control and
+  // application rings.
+  uint8_t controlStorage[cell::kLinkTxControlSize] = {0};
+  uint8_t audioStorage[cell::kLinkTxBufferSize] = {0};
+  cell::LinkTxBuffer control(controlStorage, sizeof(controlStorage));
+  cell::LinkTxBuffer audio(audioStorage, sizeof(audioStorage));
+
+  // Fill the audio ring completely, as a congested socket would.
+  uint8_t frame[cell::kLinkTxBufferSize] = {0};
+  TEST_ASSERT_EQUAL_UINT32(cell::kLinkTxBufferSize,
+                           static_cast<uint32_t>(audio.push(frame, sizeof(frame))));
+  TEST_ASSERT_EQUAL_UINT32(
+      0U, static_cast<uint32_t>(audio.push(reinterpret_cast<const uint8_t*>("x"), 1U)));
+
+  // The control ring is untouched: the signal still fits.
+  const uint8_t signal[70] = {0};
+  TEST_ASSERT_EQUAL_UINT32(70U, static_cast<uint32_t>(control.push(signal, sizeof(signal))));
+  TEST_ASSERT_EQUAL_UINT32(0U, control.rejected());
+  TEST_ASSERT_EQUAL_UINT32(70U, static_cast<uint32_t>(control.size()));
+  // One audio frame plus several call signals fit in the declared capacities.
+  TEST_ASSERT_TRUE(cell::kLinkTxBufferSize >= 668U);
+  TEST_ASSERT_TRUE(cell::kLinkTxControlSize >= 3U * 70U);
+}
+
+void testStationLinkNeverBlocksTheMainLoop() {
+  const std::string source = readSource("src/common/station_link.cpp");
+  TEST_ASSERT_TRUE_MESSAGE(!source.empty(), "station_link.cpp not found");
+  // The library write blocks for up to ten seconds: it must never be used.
+  TEST_ASSERT_FALSE_MESSAGE(contains(source, "client.write("),
+                            "station_link.cpp must not use the blocking WiFiClient::write");
+  // The only write path is a non blocking send.
+  TEST_ASSERT_TRUE(contains(source, "MSG_DONTWAIT"));
+  TEST_ASSERT_TRUE(contains(source, "&StationLink::writeSocket"));
+  // The connect timeout is synchronous: it must stay short and be backed off.
+  TEST_ASSERT_TRUE(contains(source, "kLinkMaxConnectDelayMs"));
+  TEST_ASSERT_TRUE(contains(source, "setRetryDelay"));
+  TEST_ASSERT_FALSE(contains(source, "connect(address, config_->linkPort, 400"));
+  // The received frame must be declared OUTSIDE the read loop: a LinkFrame is
+  // ~720 bytes and value initialised, so rebuilding it per received byte would
+  // burn a large part of the main loop.
+  const size_t frameDecl = source.find("LinkFrame frame;");
+  const size_t readLoop = source.find("while (budget > 0U");
+  TEST_ASSERT_TRUE(frameDecl != std::string::npos);
+  TEST_ASSERT_TRUE(readLoop != std::string::npos);
+  TEST_ASSERT_TRUE_MESSAGE(frameDecl < readLoop,
+                           "the received LinkFrame must be declared outside the read loop");
+}
+
+void testStationLinkProtectsTheRs485ReceiveBuffer() {
+  // The bus receive buffer is what absorbs a main loop that is busy with Wi-Fi,
+  // HTTP, WebSocket and the backbone. 4096 bytes at 115200 baud hold 355 ms of
+  // bus traffic, which is above the 200 ms synchronous connect timeout of the
+  // link: a transient stall can no longer make the station drop bus frames.
+  const std::string config = readSource("src/common/station_config.h");
+  TEST_ASSERT_TRUE_MESSAGE(!config.empty(), "station_config.h not found");
+  TEST_ASSERT_TRUE(contains(config, "kUartRxBufferSize = 4096"));
+  TEST_ASSERT_TRUE(contains(config, "kUartTxBufferSize = 2048"));
+  TEST_ASSERT_TRUE(contains(config, "kRs485Baud = 115200"));
+  // 4096 bytes at 115200 baud = 4096 * 10 / 115200 s = 355 ms.
+  const uint32_t busBufferMs = (4096U * 10U * 1000U) / 115200U;
+  TEST_ASSERT_TRUE(busBufferMs >= 355U);
+  TEST_ASSERT_TRUE(busBufferMs >= 200U + 100U);
+}
+

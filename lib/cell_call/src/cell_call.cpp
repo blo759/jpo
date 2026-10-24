@@ -404,14 +404,19 @@ CallStatus CallTable::acceptRemote(const char* callId, uint32_t nowMs) {
   return CallStatus::kOk;
 }
 
-CallStatus CallTable::remoteEnd(const char* callId, uint32_t nowMs) {
+CallStatus CallTable::remoteEnd(const char* callId, uint32_t nowMs, CallSession& endedOut) {
   (void)nowMs;
   CallSession* session = findMutable(callId);
   if (session == nullptr) {
     // The remote side ended a call we no longer track: nothing to do, and this
     // is not an error worth counting as a refusal.
+    endedOut = CallSession();
     return CallStatus::kOk;
   }
+  // The copy is taken BEFORE the release: the caller needs the call id, the
+  // participants and the remote node to notify the local participant, and the
+  // release clears every one of those fields.
+  endedOut = *session;
   if (session->state == CallState::kActive) {
     ++completed_;
   }

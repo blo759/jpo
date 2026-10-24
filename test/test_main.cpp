@@ -103,6 +103,33 @@ void testWifiBackboneGlueNeverUsesTheMesh();
 void testTheBusProtocolAndTheMeshWereNotTouchedByTheBackbone();
 void testTheBackboneFrameMagicCannotBeMistakenForABusFrame();
 void testTheRecordedVoicePathIsUntouchedByTheBackbone();
+void testLinkTxBufferKeepsTheFrameOrder();
+void testLinkTxBufferRetriesTheRestOfAFrameWhenTheSocketIsBusy();
+void testLinkTxBufferIsBoundedAndCountsRejections();
+void testLinkTxBufferReclaimsTheBytesAlreadyWritten();
+void testLinkTxBufferIgnoresDegenerateInput();
+void testLinkTxBufferSeparatesControlFromAudio();
+void testStationLinkNeverBlocksTheMainLoop();
+void testStationLinkProtectsTheRs485ReceiveBuffer();
+
+// test_mobility.cpp : user identity and cell changes. A move updates a location,
+// it never creates a user, a duplicate or a lost conversation.
+void testMobilityKeepsTheIdentityAndTheNameWhenAUserChangesCell();
+void testMobilityIsIdempotentOnRepeatedAnnouncements();
+void testMobilitySurvivesARoundTripThroughEveryCell();
+void testMobilityTwoUsersWithTheSameNameStayDistinct();
+void testMobilityALeavingUserGoesOfflineButIsNeverDeleted();
+void testMobilityAnUnreachableStationDoesNotEraseItsUsers();
+void testMobilityConvergesAfterAStaleAnnouncement();
+void testMobilityTheIdentifierIsTheIdentityAndNeverTheName();
+
+// test_messaging.cpp : the whole cross cell message path (routing, envelope, real
+// bus framing, fragmentation) exercised in the six directions of every cell pair.
+void testMessagingRecordedVoiceReachesEveryCellPair();
+void testMessagingTextAndReceiptsReachEveryCellPair();
+void testMessagingFollowsAUserThatChangesCell();
+void testMessagingUnknownRecipientIsRefusedExplicitly();
+void testMessagingFragmentedPayloadIsReassembled();
 
 // test_reliability.cpp : acknowledgements, protected queueing, long messages and
 // the deterministic two sender simulation.
@@ -195,6 +222,27 @@ static int runAllTests() {
   RUN_TEST(testTheBusProtocolAndTheMeshWereNotTouchedByTheBackbone);
   RUN_TEST(testTheBackboneFrameMagicCannotBeMistakenForABusFrame);
   RUN_TEST(testTheRecordedVoicePathIsUntouchedByTheBackbone);
+  RUN_TEST(testLinkTxBufferKeepsTheFrameOrder);
+  RUN_TEST(testLinkTxBufferRetriesTheRestOfAFrameWhenTheSocketIsBusy);
+  RUN_TEST(testLinkTxBufferIsBoundedAndCountsRejections);
+  RUN_TEST(testLinkTxBufferReclaimsTheBytesAlreadyWritten);
+  RUN_TEST(testLinkTxBufferIgnoresDegenerateInput);
+  RUN_TEST(testLinkTxBufferSeparatesControlFromAudio);
+  RUN_TEST(testStationLinkNeverBlocksTheMainLoop);
+  RUN_TEST(testStationLinkProtectsTheRs485ReceiveBuffer);
+  RUN_TEST(testMobilityKeepsTheIdentityAndTheNameWhenAUserChangesCell);
+  RUN_TEST(testMobilityIsIdempotentOnRepeatedAnnouncements);
+  RUN_TEST(testMobilitySurvivesARoundTripThroughEveryCell);
+  RUN_TEST(testMobilityTwoUsersWithTheSameNameStayDistinct);
+  RUN_TEST(testMobilityALeavingUserGoesOfflineButIsNeverDeleted);
+  RUN_TEST(testMobilityAnUnreachableStationDoesNotEraseItsUsers);
+  RUN_TEST(testMobilityConvergesAfterAStaleAnnouncement);
+  RUN_TEST(testMobilityTheIdentifierIsTheIdentityAndNeverTheName);
+  RUN_TEST(testMessagingRecordedVoiceReachesEveryCellPair);
+  RUN_TEST(testMessagingTextAndReceiptsReachEveryCellPair);
+  RUN_TEST(testMessagingFollowsAUserThatChangesCell);
+  RUN_TEST(testMessagingUnknownRecipientIsRefusedExplicitly);
+  RUN_TEST(testMessagingFragmentedPayloadIsReassembled);
   RUN_TEST(testQueueServesHighestPriorityFirst);
   RUN_TEST(testQueueIsBoundedAndCountsDrops);
   RUN_TEST(testQueuePromotesStarvedAudio);

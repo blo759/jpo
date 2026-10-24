@@ -84,7 +84,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.jpo.cellnet.call.CallPhase
-import com.jpo.cellnet.call.CallSessionPolicy
 import com.jpo.cellnet.data.CallEntity
 import com.jpo.cellnet.data.CallRecordState
 import com.jpo.cellnet.data.ConversationEntity
@@ -832,10 +831,9 @@ private fun ChatScreen(
     }
 
     // A live call is possible between any two cells of the deployment: the
-    // station routes a cross cell call over the Wi-Fi backbone.
+    // station routes a cross cell call over the Wi-Fi backbone. The button only
+    // needs the session to be attached to a cell.
     val callAllowed = state.cellSite != null && state.httpConnected && state.wsConnected
-    val peerStation = state.users.firstOrNull { it.id == state.activePeer }?.station
-    val crossCell = CallSessionPolicy.isCrossCell(state.cellSite, peerStation)
 
     Scaffold(
         topBar = {
@@ -853,12 +851,12 @@ private fun ChatScreen(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        // Restored to the original single, concise line. The cell of
+                        // the correspondent is a diagnostic detail: it belongs to the
+                        // call screen and to /api/health, not to the conversation
+                        // header.
                         Text(
-                            when {
-                                state.cellSite == null -> "Hors cellule"
-                                crossCell -> "Vous êtes sur $state.cellSite · appel vers $peerStation"
-                                else -> "Vous êtes sur ${state.cellSite}"
-                            },
+                            state.cellSite?.let { "Vous êtes sur $it" } ?: "Hors cellule",
                             style = MaterialTheme.typography.labelSmall
                         )
                     }
@@ -868,7 +866,7 @@ private fun ChatScreen(
                         Icon(
                             Icons.Default.Call,
                             contentDescription = if (callAllowed) {
-                                "Appeler (même cellule)"
+                                "Appeler"
                             } else {
                                 "Appel indisponible hors cellule"
                             }

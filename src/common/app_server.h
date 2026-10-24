@@ -90,7 +90,10 @@ class AppServer {
   bool hasLocalSocket(const char* userId) const;
 
   void handleSocketEvent(uint8_t clientNumber, uint8_t type, uint8_t* payload, size_t length);
-  void bindSocketToUser(uint8_t clientNumber, const char* userId);
+  // Binds a socket to a user. The display name is optional and only used to
+  // register the user on this station: a user that moves to another cell must
+  // keep its announced name instead of falling back to its raw identifier.
+  void bindSocketToUser(uint8_t clientNumber, const char* userId, const char* displayName);
   void sendJson(int code, const String& body);
   void sendStatus(int code, const char* status, const char* detail = nullptr);
   void replyRouteStatus(MeshNode::RouteStatus status, const char* targetUser);

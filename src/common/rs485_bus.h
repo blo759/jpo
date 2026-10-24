@@ -28,8 +28,8 @@ class Rs485Bus {
     pinMode(kRs485DirPin, OUTPUT);
     digitalWrite(kRs485DirPin, LOW);  // reception
 
-    serial_.setRxBufferSize(kUartBufferSize);
-    serial_.setTxBufferSize(kUartBufferSize);
+    serial_.setRxBufferSize(kUartRxBufferSize);
+    serial_.setTxBufferSize(kUartTxBufferSize);
     serial_.begin(baud, SERIAL_8N1, kRs485RxPin, kRs485TxPin);
     serial_.setTimeout(0);
     baud_ = baud;
@@ -108,7 +108,7 @@ class Rs485Bus {
     if (!txActive_) {
       return;
     }
-    const bool ringEmpty = static_cast<size_t>(serial_.availableForWrite()) >= kUartBufferSize;
+    const bool ringEmpty = static_cast<size_t>(serial_.availableForWrite()) >= kUartTxBufferSize;
     const bool uartDone =
         uart_wait_tx_done(static_cast<uart_port_t>(uartPort_), 0) == ESP_OK;
     if ((ringEmpty && uartDone) || static_cast<int32_t>(nowMs - txDeadlineMs_) >= 0) {

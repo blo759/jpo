@@ -270,15 +270,29 @@ void testRemoteEndReleasesTheSession() {
                     static_cast<int>(table.inviteRemote(kCallA, "u-a1", "u-b1", 2U, 1000U)));
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
                     static_cast<int>(table.acceptRemote(kCallA, 1500U)));
+  cell::CallSession ended;
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
-                    static_cast<int>(table.remoteEnd(kCallA, 5000U)));
+                    static_cast<int>(table.remoteEnd(kCallA, 5000U, ended)));
   TEST_ASSERT_NULL(table.find(kCallA));
   TEST_ASSERT_FALSE(table.isBusy("u-a1"));
   TEST_ASSERT_EQUAL_UINT32(1U, table.completedCalls());
+  // The copy handed back to the caller must still describe the call that was
+  // released: this is what lets the station notify the local participant AFTER
+  // the release. Reading the session through a pointer into the table returned an
+  // empty user id, so the notification was silently dropped and the remote side
+  // kept ringing for ever.
+  TEST_ASSERT_EQUAL_STRING(kCallA, ended.callId);
+  TEST_ASSERT_EQUAL_STRING("u-a1", ended.caller);
+  TEST_ASSERT_EQUAL_STRING("u-b1", ended.callee);
+  TEST_ASSERT_EQUAL_UINT8(2U, ended.remoteNode);
   // Ending a cross cell call that is already gone is not an error: the other
-  // side may have released it first.
+  // side may have released it first, and the copy must be cleared.
+  cell::CallSession again;
   TEST_ASSERT_EQUAL(static_cast<int>(cell::CallStatus::kOk),
-                    static_cast<int>(table.remoteEnd(kCallA, 6000U)));
+                    static_cast<int>(table.remoteEnd(kCallA, 6000U, again)));
+  TEST_ASSERT_EQUAL_STRING("", again.callId);
+  TEST_ASSERT_EQUAL_STRING("", again.caller);
+  TEST_ASSERT_EQUAL_STRING("", again.callee);
 }
 
 void testRemoteInvitationExpiresWithItsRemoteNode() {

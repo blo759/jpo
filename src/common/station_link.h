@@ -60,6 +60,11 @@ class StationLink {
   uint32_t audioReceived() const { return audioReceived_; }
   uint32_t authRejections() const { return authRejections_; }
   uint32_t disconnects() const { return disconnects_; }
+  // Bytes still waiting in the outbound buffers of every socket, and the worst
+  // time spent inside loop() since boot. Both are what tells a backbone problem
+  // apart from a bus problem in /api/health.
+  size_t txPending() const;
+  uint32_t maxLoopUs() const { return maxLoopUs_; }
   const LinkRoutes& routes() const { return routes_; }
   const LinkClientState& upstream() const { return upstream_; }
 
@@ -73,10 +78,26 @@ class StationLink {
     WiFiClient client;
     LinkStreamAssembler assembler;
     LinkLiveness liveness;
+    // Outbound buffers, one ring per traffic class: a burst of call audio can
+    // therefore never push out a call signal. They are drained with at most one
+    // non blocking write each per loop, so a congested socket never stalls the
+    // main loop (and never delays the RS485 bus).
+    uint8_t controlStorage[kLinkTxControlSize] = {0};
+    uint8_t audioStorage[kLinkTxBufferSize] = {0};
+    LinkTxBuffer control;
+    LinkTxBuffer audio;
     uint8_t node = 0;
     bool authenticated = false;
     bool outgoing = false;
     bool active = false;
+
+    Socket()
+        : control(controlStorage, sizeof(controlStorage)),
+          audio(audioStorage, sizeof(audioStorage)) {}
+    // The buffers point into their own storage: a copied socket would write to
+    // the storage of another one.
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
   };
 
   Socket* slotForNode(uint8_t node);
@@ -88,7 +109,11 @@ class StationLink {
   void serviceSocket(Socket& slot, uint32_t nowMs);
   void handleFrame(Socket& slot, LinkFrame& frame, uint32_t nowMs);
   void relayFrame(Socket& incoming, LinkFrame& frame);
-  bool sendFrame(Socket& slot, LinkFrame& frame);
+  // Queues one encoded frame. `control` selects the ring that must never be
+  // starved by call audio.
+  bool enqueueFrame(Socket& slot, LinkFrame& frame, bool control);
+  void flushSocket(Socket& slot);
+  static size_t writeSocket(void* context, const uint8_t* data, size_t length);
   void sendHeartbeats(uint32_t nowMs);
   void sendRouteState(Socket& slot);
 
@@ -105,6 +130,10 @@ class StationLink {
 
   uint32_t lastHeartbeatMs_ = 0;
   uint32_t lastRouteStateMs_ = 0;
+  // Progressive reconnection backoff: a station that keeps failing must stop
+  // hammering the radio, and the connect() call is synchronous.
+  uint32_t connectDelayMs_ = 0;
+  uint32_t maxLoopUs_ = 0;
   uint32_t framesSent_ = 0;
   uint32_t framesReceived_ = 0;
   uint32_t framesRelayed_ = 0;

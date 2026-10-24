@@ -16,7 +16,13 @@ constexpr uint8_t kLedRxPin = 26;     // red LED     -> real RS485 reception
 
 constexpr uint8_t kRs485UartPort = 2;
 constexpr uint32_t kRs485Baud = 115200;
-constexpr size_t kUartBufferSize = 1024;
+// RS485 UART buffers. The receive buffer is what absorbs a main loop that is
+// momentarily busy with Wi-Fi, HTTP, WebSocket or the inter-station link: at
+// 115200 baud 4096 bytes hold 355 ms of bus traffic instead of 89 ms, so a
+// transient stall can no longer make the station drop bus frames, that is text
+// messages, recorded voice blocks and their acknowledgements.
+constexpr size_t kUartRxBufferSize = 4096;
+constexpr size_t kUartTxBufferSize = 2048;
 
 // Inter-station IP link (Wi-Fi backbone). 8080 (HTTP) and 8081 (WebSocket) are
 // unchanged; the backbone has its own port.

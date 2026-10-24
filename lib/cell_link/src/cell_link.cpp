@@ -408,6 +408,66 @@ uint8_t LinkRoutes::relayTarget(uint8_t dstNode, uint8_t incomingNode, uint8_t h
 }
 
 // ---------------------------------------------------------------------------
+// Non blocking outbound buffer
+// ---------------------------------------------------------------------------
+LinkTxBuffer::LinkTxBuffer(uint8_t* storage, size_t capacity)
+    : data_(storage), capacity_(capacity) {}
+
+void LinkTxBuffer::clear() {
+  length_ = 0U;
+  sent_ = 0U;
+}
+
+void LinkTxBuffer::compact() {
+  if (sent_ == 0U) {
+    return;
+  }
+  const size_t remaining = length_ - sent_;
+  if (remaining > 0U) {
+    memmove(data_, data_ + sent_, remaining);
+  }
+  length_ = remaining;
+  sent_ = 0U;
+}
+
+size_t LinkTxBuffer::push(const uint8_t* bytes, size_t count) {
+  if (data_ == nullptr || bytes == nullptr || count == 0U) {
+    return 0U;
+  }
+  // Reclaim the space of the bytes already written before giving up.
+  if (sent_ > 0U) {
+    compact();
+  }
+  if (length_ + count > capacity_) {
+    ++rejected_;
+    return 0U;
+  }
+  memcpy(data_ + length_, bytes, count);
+  length_ += count;
+  return count;
+}
+
+size_t LinkTxBuffer::flush(WriteFn write, void* context) {
+  if (data_ == nullptr || write == nullptr || length_ == 0U) {
+    return 0U;
+  }
+  const size_t remaining = length_ - sent_;
+  if (remaining == 0U) {
+    clear();
+    return 0U;
+  }
+  const size_t written = write(context, data_ + sent_, remaining);
+  if (written == 0U) {
+    return 0U;
+  }
+  sent_ += (written > remaining) ? remaining : written;
+  if (sent_ >= length_) {
+    clear();
+  }
+  return written;
+}
+
+// ---------------------------------------------------------------------------
 // Link health
 // ---------------------------------------------------------------------------
 void LinkClientState::begin(uint32_t nowMs, uint32_t retryMs) {
@@ -438,6 +498,10 @@ bool LinkClientState::shouldAttempt(uint32_t nowMs) const {
 void LinkClientState::noteAttempt(uint32_t nowMs) {
   ++attempts_;
   nextAttemptMs_ = nowMs + retryMs_;
+}
+
+void LinkClientState::setRetryDelay(uint32_t retryMs) {
+  retryMs_ = (retryMs == 0U) ? 1000U : retryMs;
 }
 
 void LinkLiveness::begin(uint32_t nowMs) {

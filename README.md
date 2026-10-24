@@ -19,9 +19,9 @@ système validé sur banc avec trois cartes physiques.
 
 | Élément | État |
 |---|---|
-| Compilation `site_a`, `site_b`, `site_c` | ✅ réalisée sur ce poste (PlatformIO 6.2.0, espressif32 6.6.0) — RAM 24,9 %, Flash 65,1 % |
-| Tests unitaires du cœur de transport, des appels et de la dorsale Wi‑Fi (103 tests) | ✅ exécutés sur ce poste (`pio test -e native`) — 103/103 |
-| Tests unitaires JVM de l'application Android (71 tests) | ✅ **exécutés** sur ce poste (JDK 17.0.20.1 + Gradle 8.7 + SDK 34) — 71/71 |
+| Compilation `site_a`, `site_b`, `site_c` | ✅ réalisée sur ce poste (PlatformIO 6.2.0, espressif32 6.6.0) — RAM 27,1 %, Flash 65,2 % |
+| Tests unitaires du cœur de transport, des appels, de la dorsale Wi‑Fi, de l'identité mobile et de la messagerie intercellulaire (124 tests) | ✅ exécutés sur ce poste (`pio test -e native`) — 124/124 |
+| Tests unitaires JVM de l'application Android (77 tests) | ✅ **exécutés** sur ce poste (JDK 17.0.20.1 + Gradle 8.7 + SDK 34) — 77/77 |
 | Compilation de l'application Android | ✅ `testDebugUnitTest assembleDebug assembleRelease` → `BUILD SUCCESSFUL` (`app-debug.apk` 15,9 Mo, `app-release.apk` 10,3 Mo) |
 | Génération des trois binaires distincts | ✅ vérifiée (empreintes SHA‑256 différentes) |
 | Appels audio en direct, même cellule | ✅ implémentés (signalisation HTTP + média WebSocket binaire local) |
@@ -1334,10 +1334,12 @@ anti‑boucle et limite de sauts, effacement des routes après une perte de liai
 politique de reconnexion, vivacité, et les cinq garde‑fous structurels qui
 interdisent toute dépendance de la dorsale au bus RS485.
 
-**Total : 103 tests natifs** (7 protocole + 19 cœur + 18 fiabilité = 44
-d'origine, + 38 appels + 21 dorsale) et **71 tests JVM Android** (24 d'origine +
+**Total : 124 tests natifs** (7 protocole + 19 cœur + 18 fiabilité = 44
+d'origine, + 38 appels + 21 dorsale, + 21 ajoutés par l'audit du §19 :
+8 file d'émission non bloquante et gardes structurelles, 8 identité/mobilité,
+5 messagerie intercellulaire) et **77 tests JVM Android** (24 d'origine +
 47 d'appel : protocole, tampon de gigue, garde cellulaire et appels
-intercellulaires autorisés).
+intercellulaires autorisés, + 6 message `hello` du §19.3).
 
 ---
 
@@ -2090,20 +2092,23 @@ Le mécanisme ajouté côté dorsale est limité à ce qui est indispensable :
 ### 18.12 Tests exécutés
 
 ```powershell
-# Tests natifs : 103 (72 précédents + 31 nouveaux pour la dorsale et les appels intercellulaires)
+# Tests natifs : 124 (103 de la dorsale et des appels + 21 pour l'audit du §19)
 & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" test -e native
 
 # Les trois firmwares
 & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e site_a -e site_b -e site_c
 
-# Application Android : 71 tests JVM + APK
+# Application Android : 77 tests JVM + APK
 cd mobile
 gradle testDebugUnitTest assembleDebug assembleRelease
 ```
 
-**Résultats obtenus sur ce poste** : `103 test cases: 103 succeeded` ·
-`site_a`/`site_b`/`site_c` SUCCESS (RAM 24,9 %, Flash 65,1 %) ·
-`BUILD SUCCESSFUL` avec **71 tests JVM, 0 échec**.
+**Résultats obtenus sur ce poste** : `124 test cases: 124 succeeded` ·
+`site_a`/`site_b`/`site_c` SUCCESS (RAM 27,1 %, Flash 65,2 %) ·
+`BUILD SUCCESSFUL` avec **77 tests JVM, 0 échec**.
+
+> Ces chiffres sont ceux **avant** la section 19, qui ajoute 21 tests natifs et
+> 6 tests JVM : le total après audit est de **124 natifs** et **77 JVM** (§19.9).
 
 Couverture ajoutée (natif) :
 
@@ -2213,4 +2218,266 @@ Aucun de ces points n'est couvert par un test automatisé : les tests fournis
 vérifient la logique de session, le routage, l'authentification, le format des
 trames, la reconnexion et l'absence de dépendance au bus — **pas** la qualité
 audio ni la stabilité radio sur matériel réel.
+
+---
+
+## 19. Audit des régressions après l'ajout des appels intercellulaires
+
+Cette section documente l'audit mené après la mise en service des appels audio
+entre cellules : quelles régressions existaient réellement, quelle en était la
+cause **dans le code**, et ce qui a été corrigé. Elle distingue explicitement ce
+qui est **prouvé par lecture du code et par test** de ce qui reste **non
+vérifiable sans matériel**.
+
+### 19.1 Méthode : ce que le diff Git prouve
+
+Les hunks de `git diff 583366a..HEAD` (premier commit → état des appels
+intercellulaires) ont été relevés fonction par fonction. Résultat :
+
+| Fichier | Touché par l'ajout des appels intercellulaires ? |
+|---|---|
+| `lib/cell_protocol/*` | **non** — identique octet pour octet |
+| `lib/cell_core/*` (file, arbitre, table de routage, enveloppe, fragmentation) | **non** — identique octet pour octet |
+| `src/common/mesh_node.{h,cpp}` | **non** — identique octet pour octet |
+| `src/common/rs485_bus.h` | **oui**, uniquement les tailles de tampon UART (§19.4) |
+| `src/common/app_server.cpp` | **oui** : constructeur, `begin()` (nouvelles routes), `loop()` (+1 appel), `handleSocketEvent` (cas `WStype_BIN` + libération d'appel à la déconnexion), `handleInfo`/`handleHealth` (JSON additif), puis le bloc d'appel inséré après `handlePresenceLeave` |
+| `handleText`, `handleReceipt`, `handleVoiceBlock`, `handleVoiceFeedback` | **absents de tous les hunks** — chemin vocal enregistré inchangé |
+
+Côté Android, `git diff 71c3997..HEAD -- AppViewModel.kt` ne touche que les zones
+d'appel : `ensureConnected`, `detectCell`, `clearStation`, `sendVoiceClip`,
+`uploadBlocks`, `handleVoiceBlockData`, `completeVoiceTransfer` et
+`onVoiceControl` sont **inchangés**.
+
+**Conclusion de l'audit** : le chemin d'un message vocal enregistré
+(téléphone → station → bus RS485 → station → téléphone) est **inchangé de bout en
+bout**. Une perte de messages ne peut donc pas venir d'une modification de ce
+chemin : elle ne peut venir que de son **environnement d'exécution**, c'est‑à‑dire
+du temps de boucle principale, partagé avec la dorsale Wi‑Fi.
+
+### 19.2 Régression 1 — le raccrochage n'était pas propagé (corrigée)
+
+**Symptôme** : un participant raccroche, l'autre reste en appel.
+
+**Cause racine** (lecture de `AppServer::onLinkSignal`) : le gestionnaire
+conservait des `const char*` **pointant à l'intérieur de la session**
+(`localParticipant(*session)`, `session->caller`, `session->callee`), puis
+appelait `calls_.remoteEnd(...)`, qui **libère la session** et remet ces champs à
+`'\0'`. `notifyCallEnded(local, callId, peer, ...)` recevait donc un identifiant
+vide et sortait immédiatement (`if (userId[0] == '\0') return;`) : l'événement
+`call_ended` / `call_rejected` / `call_cancelled` n'était **jamais** poussé au
+participant local. Les quatre actions terminales (`kSignalReject`,
+`kSignalCancel`, `kSignalHangup`, `kSignalEnded`) étaient concernées, dans **les
+deux sens**.
+
+**Correction** : `CallTable::remoteEnd(callId, nowMs, CallSession& endedOut)`
+renvoie désormais une **copie** de la session libérée, prise **avant** la
+libération — le même schéma que `CallTable::endForUser(..., CallSession&
+endedOut)` qui existait déjà. Le gestionnaire ne travaille plus que sur cette
+copie : le bug est devenu **structurellement impossible**, pas simplement
+corrigé.
+
+**Preuve** : `testRemoteEndReleasesTheSession` vérifie que la copie rendue contient
+encore `callId`, `caller`, `callee` et `remoteNode` alors que `table.find()`
+renvoie `NULL`, et qu'un second appel sur une session déjà libérée rend une copie
+vide sans erreur (terminaison idempotente).
+
+### 19.3 Régression 2 — le nom d'affichage était remplacé par l'identifiant (corrigée)
+
+**Symptôme** : après un changement de cellule, l'utilisateur apparaît comme
+`u-3f2a1b9c0d` sur les autres cellules — comme s'il s'agissait d'une autre
+personne.
+
+**Ce qui n'était PAS la cause** (vérifié) :
+
+* `UserProfileStore.save()` réutilise l'identifiant existant
+  (`val id = existingId ?: generateUserId()`) : **aucun nouvel utilisateur n'est
+  créé** quand le téléphone change de point d'accès ;
+* `RoutingTable::upsert` est indexé par `userId` (`findMutable` puis `allocate`
+  seulement si absent) : **aucun doublon n'est possible** pour un même
+  identifiant ;
+* le changement de cellule met bien à jour la localisation : l'entrée est
+  **déplacée** (`entry->station = station`) et l'ancienne cellule cesse de
+  l'annoncer, puisque son annonce ne liste que les entrées dont
+  `station == ownStation`.
+
+**Cause racine** : `AppServer::bindSocketToUser` faisait
+
+```cpp
+if (!mesh_.refreshLocalUser(id)) {
+  mesh_.registerLocalUser(id, id);   // le nom devient l'identifiant
+}
+```
+
+Sur la cellule d'arrivée, l'utilisateur est inconnu : il était donc enregistré
+avec **son identifiant comme nom d'affichage**, et cette paire `(id, id)` était
+ensuite propagée par l'annonce de présence à toutes les autres cellules. Selon
+l'ordre d'arrivée entre l'enregistrement HTTP de présence et le `hello`
+WebSocket, le nom réel était restauré plus ou moins vite (au plus tard au
+rafraîchissement de présence suivant, 30 s) — d'où un affichage incohérent et
+intermittent.
+
+**Correction** : le `hello` WebSocket transporte désormais le **nom d'affichage**
+en plus de l'identifiant stable (`HelloMessage.build`), et
+`bindSocketToUser(clientNumber, userId, displayName)` l'utilise. Le repli sur
+l'identifiant ne subsiste que pour un client plus ancien qui n'enverrait pas de
+nom.
+
+**Preuve** : `HelloMessageTest` (6 tests JVM) fixe le contrat exact du message,
+y compris l'échappement JSON d'un nom contenant guillemets, antislash, retour à
+la ligne et caractère de contrôle ; `test_mobility.cpp` (8 tests natifs) vérifie
+que l'identité, le nom et la localisation survivent à A→B→C→A, aux annonces
+répétées, aux annonces reçues dans le désordre, à la déconnexion et au retour, et
+que deux personnes portant le **même nom** restent deux utilisateurs distincts.
+
+### 19.4 Régression 3 — la dorsale bloquait la boucle principale (corrigée)
+
+**Symptôme** : messages texte et vocaux perdus de façon **asymétrique** entre
+cellules (certaines paires fonctionnent, d'autres non, une réponse n'arrive pas),
+apparu avec les appels intercellulaires.
+
+**Cause racine** : le chemin des messages enregistrés est inchangé (§19.1), mais
+son **environnement** ne l'était plus. Deux appels bloquants avaient été
+introduits dans la boucle principale :
+
+1. `WiFiClient::connect(ip, port, 400)` est **synchrone** : la source du framework
+   montre un `select()` de toute la durée du `timeout_ms`. Il était retenté
+   toutes les 2 s tant que la liaison n'était pas établie.
+2. `WiFiClient::write()` boucle **10 fois avec un `select()` d'une seconde**
+   (`WIFI_CLIENT_MAX_WRITE_RETRY = 10`, `WIFI_CLIENT_SELECT_TIMEOUT_US =
+   1000000`). Il était appelé à chaque trame de la dorsale, soit jusqu'à 50 fois
+   par seconde pendant un appel.
+
+Pendant un tel blocage, `gMesh.loop()` n'est pas appelé : le tampon RX du bus
+RS485 (1024 octets ≈ **89 ms** à 115 200 bauds) **déborde**, et les trames
+perdues sont exactement les messages texte, les blocs vocaux et leurs accusés.
+Un blocage de plusieurs secondes explique aussi l'asymétrie observée : la cellule
+qui relaie (le concentrateur) bloque plus longtemps que les feuilles.
+
+**Corrections** :
+
+* `lib/cell_link` gagne `LinkTxBuffer` : une file **bornée, orientée trames
+  entières**, vidée par **un seul `send(MSG_DONTWAIT)`** par anneau et par
+  boucle. L'ordre des octets est préservé et une trame partiellement écrite n'est
+  jamais jetée, donc le flux vu par le pair reste valide même quand la socket
+  n'accepte qu'une partie de la trame ;
+* **deux anneaux par socket** — contrôle et audio — comme les anneaux
+  « contrôle » et « applicatif » du bus : une rafale d'audio d'appel ne peut
+  jamais chasser un signal d'appel ;
+* `station_link.cpp` n'appelle plus **jamais** `WiFiClient::write()` ni
+  `readBytes()` : une assertion de test échoue si l'un des deux revient ;
+* le délai de connexion passe de 400 ms à **200 ms**, avec un **backoff
+  progressif** (2 s → 4 s → … → 30 s) remis à zéro dès que la liaison montante
+  répond, pour ne plus marteler la radio ;
+* le tampon RX du bus RS485 passe de 1024 à **4096 octets** (≈ **355 ms** de
+  trafic), au‑dessus du pire blocage synchrone restant (200 ms). Le bus et son
+  protocole sont inchangés : seule la marge du tampon augmente ;
+* `LinkFrame` (≈ 720 octets, initialisé) n'est plus construit **à chaque octet
+  reçu** mais une seule fois par socket et par boucle ;
+* deux compteurs de diagnostic sont exposés dans `/api/health` et `/api/info` :
+  `link.txPending` (octets encore en attente d'écriture) et `link.maxLoopUs`
+  (pire temps passé dans le service de la dorsale depuis le démarrage). Un
+  `txPending` qui grimpe signale une dorsale saturée ; un `maxLoopUs` élevé
+  signale que le tampon du bus a été mis en danger.
+
+**Preuves** :
+
+* `testLinkTxBufferKeepsTheFrameOrder`,
+  `…RetriesTheRestOfAFrameWhenTheSocketIsBusy` (écriture partielle : rien n'est
+  perdu ni dupliqué, l'ordre est conservé), `…IsBoundedAndCountsRejections`,
+  `…ReclaimsTheBytesAlreadyWritten`, `…IgnoresDegenerateInput`,
+  `…SeparatesControlFromAudio` ;
+* `testStationLinkNeverBlocksTheMainLoop` : `client.write(` **interdit** dans
+  `station_link.cpp`, `MSG_DONTWAIT` et le backoff **exigés**, et `LinkFrame`
+  doit être déclaré **hors** de la boucle de lecture ;
+* `testStationLinkProtectsTheRs485ReceiveBuffer` : 4096 octets à 115 200 bauds
+  = 355 ms, vérifié par calcul, et supérieur au délai de connexion synchrone.
+
+### 19.5 Régression 4 — en‑tête de conversation encombré (corrigée)
+
+**Ce qui avait changé** : le sous‑titre de la barre supérieure affichait
+« Vous êtes sur SITE_A · appel vers SITE_B » pour un correspondant d'une autre
+cellule, et le libellé d'accessibilité du bouton d'appel était resté
+« Appeler (même cellule) » alors que l'appel intercellulaire était devenu
+possible.
+
+**Correction** : le sous‑titre est **restauré à l'identique** de la version
+d'origine, soit `"Vous êtes sur <site>"` ou `"Hors cellule"` sur une seule ligne
+concise, et le libellé du bouton redevient `"Appeler"`. La cellule du
+correspondant n'est plus affichée dans l'en‑tête : c'est une information de
+diagnostic, elle reste sur l'écran d'appel (qui indique déjà « Appel vers
+SITE_B ») et dans `/api/health`. La flèche de retour, le nom de la conversation
+et l'action d'appel restent à leur place d'origine.
+
+**Preuve** : le sous‑titre est comparé caractère par caractère à celui de
+`git show 583366a:mobile/…/Screens.kt`, l'import devenu inutile est retiré,
+`BUILD SUCCESSFUL` et 77/77 tests JVM.
+
+### 19.6 Ce qui n'a **pas** été trouvé (et pourquoi)
+
+| Point signalé | Constat de l'audit |
+|---|---|
+| Création d'un **nouvel utilisateur** au changement de cellule | **Inexistant** dans le code : l'identifiant est stable (`UserProfileStore`) et `upsert` est indexé par identifiant. La seule anomalie réelle concernait le **nom** (§19.3), corrigée. |
+| **Doublons** d'utilisateurs | **Impossibles par construction** pour un même identifiant. Deux personnes de même nom restent deux entrées : c'est le comportement attendu et il est testé. |
+| Fusion de deux comptes sur la base d'un nom identique | **Aucune fusion n'existe** dans le code, et aucune n'a été ajoutée. |
+| Suppression de l'identité, de l'historique ou des conversations lors d'un déplacement | **Inexistante** : une déconnexion marque l'entrée *hors ligne* (`online = false`) sans la supprimer, et une station injoignable marque ses utilisateurs hors ligne sans effacer leurs entrées. Testé. |
+| Messages vocaux enregistrés cassés par une modification de leur chemin | **Aucune modification** de ce chemin (§19.1) : la cause était l'environnement d'exécution (§19.4). |
+| **Annonces vocales** (diffusion à plusieurs cellules) | **Cette fonctionnalité n'existe pas dans ce dépôt** : aucune route, aucun type de message, aucune entité, aucun écran, aucune trace dans le code ni dans l'historique Git. Il n'y a donc rien à auditer ni à restaurer, et rien n'a été inventé pour « combler » ce point. Le prototype fournit trois fonctions vocales distinctes : les **messages vocaux enregistrés** (§9), les **appels audio locaux** (§17) et les **appels audio intercellulaires** (§18). |
+| **Salons de discussion** (conversations de groupe) | **Cette fonctionnalité n'existe pas** : l'application gère des **conversations 1‑à‑1** (`ConversationEntity` par correspondant). L'« en‑tête des salons de discussion » a donc été interprété comme la **barre supérieure de l'écran de conversation**, seule zone concernée par la régression (§19.5). |
+| Adresses IP ou messages de débogage dans l'en‑tête de conversation | **Aucun** : les adresses des stations sont affichées dans l'onglet **« Cellule »** (écran de diagnostic) et dans `/api/health`, comme avant l'ajout des appels. L'en‑tête ne contenait que la cellule courante, désormais restaurée. |
+
+### 19.7 Limite connue documentée, non corrigée
+
+Le tableau de routage suit la règle « la dernière annonce gagne ». Si l'annonce
+d'une cellule **quittée par un utilisateur** est encore en vol quand l'annonce de
+la cellule d'arrivée est traitée, l'entrée peut revenir temporairement sur
+l'ancienne cellule. La convergence est immédiate : enregistrer ou perdre un
+utilisateur local marque la présence comme « à publier », donc la cellule
+d'accueil réémet son annonce sans attendre les 10 s du cycle périodique, et il
+n'y a jamais qu'**une seule** entrée pour un identifiant donné.
+
+Ce comportement est **documenté et testé tel quel**
+(`testMobilityConvergesAfterAStaleAnnouncement`) plutôt que masqué. Le supprimer
+demanderait un **numéro de version monotone** dans le message de présence,
+c'est‑à‑dire une modification de format sur le bus RS485 ; elle n'a pas été faite,
+faute de nécessité démontrée et parce que la consigne est de ne pas modifier le
+protocole sans justification.
+
+### 19.8 Tests ajoutés par cet audit
+
+| Fichier | Contenu |
+|---|---|
+| `test/test_mobility.cpp` *(nouveau)* | 8 tests d'identité et de mobilité : A→B, A→B→C→A, annonces répétées, annonces désordonnées, même nom pour deux personnes, départ = hors ligne (jamais supprimé), station injoignable, identifiant qui ne devient jamais le nom |
+| `test/test_messaging.cpp` *(nouveau)* | 5 tests du chemin complet d'un message, **dans les six directions** : vocal enregistré, texte + accusé aller‑retour, routage vers la **nouvelle** cellule après un déplacement, refus explicite d'un destinataire inconnu ou hors ligne, charge utile fragmentée puis réassemblée octet pour octet |
+| `test/test_link.cpp` | 8 tests ajoutés : file d'émission non bloquante (ordre, écriture partielle, bornage, récupération d'espace, entrées dégénérées, séparation contrôle/audio) et 2 gardes structurelles (aucun `client.write`, marge du tampon RS485) |
+| `test/test_call.cpp` | `testRemoteEndReleasesTheSession` étendu : la copie rendue à l'appelant doit encore décrire l'appel libéré |
+| `mobile/…/test/…/HelloMessageTest.kt` *(nouveau)* | 6 tests JVM du message `hello` : identifiant + nom, repli sur l'identifiant si le nom est vide, échappement JSON, une seule ligne, taille bornée |
+
+### 19.9 Résultats réellement observés
+
+| Vérification | Commande | Résultat |
+|---|---|---|
+| Tests natifs | `pio test -e native` | **124/124 réussis**, 0 échec |
+| Tests JVM Android | `gradle -p mobile testDebugUnitTest` | **77/77 réussis**, 0 échec |
+| Firmware `SITE_A` | `pio run -e site_a` | **SUCCESS** — RAM 27,1 %, Flash 65,2 % |
+| Firmware `SITE_B` | `pio run -e site_b` | **SUCCESS** — RAM 27,1 %, Flash 65,2 % |
+| Firmware `SITE_C` | `pio run -e site_c` | **SUCCESS** — RAM 27,1 %, Flash 65,2 % |
+| APK Android | `gradle -p mobile assembleDebug assembleRelease` | **BUILD SUCCESSFUL** — `app-debug.apk` 15,91 Mo, `app-release.apk` 10,31 Mo |
+
+La RAM statique passe de 24,9 % à 27,1 % : les files d'émission de la dorsale
+(3 sockets × 2 anneaux) et la marge supplémentaire du tampon RX du bus.
+
+### 19.10 Ce que cet audit ne prouve toujours pas
+
+Aucune carte ESP32, aucun téléphone, aucun bus RS485 et aucun réseau Wi‑Fi réel
+n'étaient accessibles depuis cet environnement. En conséquence :
+
+* **aucun appel réel n'a été passé**, ni local ni intercellulaire, et le
+  raccrochage corrigé (§19.2) n'a **pas** été observé sur deux téléphones ;
+* la disparition effective des pertes de messages (§19.4) n'a **pas** été mesurée
+  sur trois cartes : la correction supprime les blocages identifiés par lecture
+  du framework, elle ne les remplace pas par une mesure de terrain ;
+* la qualité audio, la latence perçue, le taux de perte, l'écho et la stabilité
+  radio restent **non vérifiés** ;
+* le protocole d'essai complet des §17.14 et §18.15 reste **à exécuter sur
+  matériel**.
 
