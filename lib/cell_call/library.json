@@ -1,0 +1,9 @@
+{
+  "name": "cell_call",
+  "version": "1.0.0",
+  "keywords": ["esp32", "call", "voip", "local"],
+  "description": "Local only real time audio call bookkeeping: two party session table, cellular isolation and binary media frame validation. Deliberately independent from the RS485 bus protocol.",
+  "license": "MIT",
+  "platforms": ["espressif32", "native"],
+  "frameworks": "*"
+}

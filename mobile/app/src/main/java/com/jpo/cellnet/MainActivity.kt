@@ -21,10 +21,12 @@ class MainActivity : ComponentActivity() {
                 val state by viewModel.state.collectAsStateWithLifecycle()
                 val conversations by viewModel.conversations.collectAsStateWithLifecycle()
                 val messages by viewModel.messages.collectAsStateWithLifecycle()
+                val callHistory by viewModel.callHistory.collectAsStateWithLifecycle()
                 CellNetRoot(
                     state = state,
                     conversations = conversations,
                     messages = messages,
+                    callHistory = callHistory,
                     viewModel = viewModel
                 )
             }

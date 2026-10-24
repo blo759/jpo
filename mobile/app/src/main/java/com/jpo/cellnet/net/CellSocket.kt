@@ -68,6 +68,16 @@ class CellSocket(private val listener: Listener) {
         })
     }
 
+    /**
+     * Sends one binary frame. Used by live calls: the media of a call is a
+     * binary WebSocket payload, never a base64 JSON body and never a bus frame.
+     */
+    fun sendBinary(bytes: ByteArray): Boolean {
+        val current = socket ?: return false
+        if (!connected) return false
+        return runCatching { current.send(ByteString.of(*bytes)) }.getOrDefault(false)
+    }
+
     fun disconnect() {
         connected = false
         socket?.close(1000, "bye")

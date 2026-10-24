@@ -37,6 +37,38 @@ void testFragmentDuplicateIsIgnored();
 void testFragmentRejectsInvalidIndex();
 void testFragmentContextExpires();
 
+// test_call.cpp : local real time calls (session table, cellular isolation,
+// timeouts, media relay validation) and the structural guards proving that call
+// audio never travels on the RS485 bus.
+void testCallInviteWithinSameCellIsAccepted();
+void testCallAcceptThenHangupCompletesTheCall();
+void testCallBetweenTwoCellsIsRefused();
+void testCallFromAUserOfAnotherCellIsRefused();
+void testCallToAnUnknownUserIsRefused();
+void testCallWithoutAProbeIsRefused();
+void testCallToSelfIsRefused();
+void testBusyUserCannotReceiveASecondIncompatibleSession();
+void testCallerCannotAcceptItsOwnInvitation();
+void testAcceptRequiresARingingSession();
+void testExpiredInvitationCannotBeAccepted();
+void testRingingSessionExpiresOnTheStationSide();
+void testDisconnectionReleasesTheSessionAndThePeerIsReported();
+void testEndForUserWithoutSessionIsReported();
+void testEstablishedCallWithoutMediaIsDropped();
+void testMediaKeepsTheSessionAlive();
+void testRepeatedInvitationsAreRateLimited();
+void testInvalidCallIdIsRefused();
+void testCallTableIsBoundedAndNeverLeaks();
+void testMediaRelayOnlyInsideAnActiveSession();
+void testMediaRelayStopsWhenTheCallEnds();
+void testCallAudioFrameRoundTrip();
+void testCallAudioFrameRejectsMalformedInput();
+void testCallAudioFrameBuilderRejectsInvalidInput();
+void testCallAudioMagicCannotBeMistakenForABusFrame();
+void testCallModuleDoesNotDependOnTheBusLibraries();
+void testStationCallHandlersNeverSubmitToTheMesh();
+void testMeshNodeAndProtocolWereNotTouchedByTheCallFeature();
+
 // test_reliability.cpp : acknowledgements, protected queueing, long messages and
 // the deterministic two sender simulation.
 void testAckTrackerClearsOnlyTheAcknowledgedFragment();
@@ -69,6 +101,34 @@ static int runAllTests() {
   RUN_TEST(testAssemblerResynchronisesAfterGarbage);
   RUN_TEST(testAssemblerHandlesByteByByteStream);
   RUN_TEST(testProtocolTypeNames);
+  RUN_TEST(testCallInviteWithinSameCellIsAccepted);
+  RUN_TEST(testCallAcceptThenHangupCompletesTheCall);
+  RUN_TEST(testCallBetweenTwoCellsIsRefused);
+  RUN_TEST(testCallFromAUserOfAnotherCellIsRefused);
+  RUN_TEST(testCallToAnUnknownUserIsRefused);
+  RUN_TEST(testCallWithoutAProbeIsRefused);
+  RUN_TEST(testCallToSelfIsRefused);
+  RUN_TEST(testBusyUserCannotReceiveASecondIncompatibleSession);
+  RUN_TEST(testCallerCannotAcceptItsOwnInvitation);
+  RUN_TEST(testAcceptRequiresARingingSession);
+  RUN_TEST(testExpiredInvitationCannotBeAccepted);
+  RUN_TEST(testRingingSessionExpiresOnTheStationSide);
+  RUN_TEST(testDisconnectionReleasesTheSessionAndThePeerIsReported);
+  RUN_TEST(testEndForUserWithoutSessionIsReported);
+  RUN_TEST(testEstablishedCallWithoutMediaIsDropped);
+  RUN_TEST(testMediaKeepsTheSessionAlive);
+  RUN_TEST(testRepeatedInvitationsAreRateLimited);
+  RUN_TEST(testInvalidCallIdIsRefused);
+  RUN_TEST(testCallTableIsBoundedAndNeverLeaks);
+  RUN_TEST(testMediaRelayOnlyInsideAnActiveSession);
+  RUN_TEST(testMediaRelayStopsWhenTheCallEnds);
+  RUN_TEST(testCallAudioFrameRoundTrip);
+  RUN_TEST(testCallAudioFrameRejectsMalformedInput);
+  RUN_TEST(testCallAudioFrameBuilderRejectsInvalidInput);
+  RUN_TEST(testCallAudioMagicCannotBeMistakenForABusFrame);
+  RUN_TEST(testCallModuleDoesNotDependOnTheBusLibraries);
+  RUN_TEST(testStationCallHandlersNeverSubmitToTheMesh);
+  RUN_TEST(testMeshNodeAndProtocolWereNotTouchedByTheCallFeature);
   RUN_TEST(testQueueServesHighestPriorityFirst);
   RUN_TEST(testQueueIsBoundedAndCountsDrops);
   RUN_TEST(testQueuePromotesStarvedAudio);

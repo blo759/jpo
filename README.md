@@ -19,15 +19,16 @@ système validé sur banc avec trois cartes physiques.
 
 | Élément | État |
 |---|---|
-| Compilation `site_a`, `site_b`, `site_c` | ✅ réalisée sur ce poste (PlatformIO 6.2.0, espressif32 6.6.0) — RAM 25,7 %, Flash 62,7 % |
-| Tests unitaires du cœur de transport (44 tests) | ✅ exécutés sur ce poste (`pio test -e native`) |
-| Tests unitaires JVM de l'application Android (24 tests) | ✅ **exécutés** sur ce poste (JDK 17.0.20.1 + Gradle 8.7 + SDK 34) — 24/24 |
-| Compilation de l'application Android | ✅ `clean testDebugUnitTest assembleDebug assembleRelease` → `BUILD SUCCESSFUL` (`app-debug.apk` 15,7 Mo, `app-release.apk` 10,3 Mo) |
+| Compilation `site_a`, `site_b`, `site_c` | ✅ réalisée sur ce poste (PlatformIO 6.2.0, espressif32 6.6.0) — RAM 24,1 %, Flash 63,8 % |
+| Tests unitaires du cœur de transport + appels (72 tests) | ✅ exécutés sur ce poste (`pio test -e native`) — 72/72 |
+| Tests unitaires JVM de l'application Android (69 tests) | ✅ **exécutés** sur ce poste (JDK 17.0.20.1 + Gradle 8.7 + SDK 34) — 69/69 |
+| Compilation de l'application Android | ✅ `testDebugUnitTest assembleDebug assembleRelease` → `BUILD SUCCESSFUL` (`app-debug.apk` 15,9 Mo, `app-release.apk` 10,3 Mo) |
 | Génération des trois binaires distincts | ✅ vérifiée (empreintes SHA‑256 différentes) |
-| Compilation de l'application Android | ✅ réalisée sur ce poste (JDK 17 + Gradle 8.7 + Android SDK 34), `app-debug.apk` et `app-release.apk` produits |
+| Appels audio en direct, même cellule | ✅ implémentés (signalisation HTTP + média WebSocket binaire local) — isolation cellulaire vérifiée par tests |
 | Tests RS485 entre deux / trois cartes | ❌ non réalisés (pas de matériel accessible depuis cet environnement) |
 | Tests Wi‑Fi réels, téléphone ↔ station | ❌ non réalisés |
 | Tests audio de bout en bout | ❌ non réalisés |
+| Appel réel entre deux téléphones | ❌ non réalisé (aucun téléphone ni carte accessible depuis cet environnement) |
 
 Les sections « Tests » et « Limitations » précisent ce qui reste à valider sur
 le matériel.
@@ -674,7 +675,8 @@ Aucune application n'existait dans le dépôt : elle a été créée dans `mobil
 | `ACCESS_WIFI_STATE`, `CHANGE_WIFI_STATE` | lire le SSID, demander un changement de réseau | installation |
 | `ACCESS_FINE_LOCATION` | Android exige la localisation pour lire le SSID, **sur toutes les versions** (`WifiInfo.getSSID()`), et elle reste nécessaire sur Android 13+ pour éviter un SSID masqué | au démarrage, et bouton « Autoriser » |
 | `NEARBY_WIFI_DEVICES` (API 33+) | accès aux API Wi‑Fi sur Android 13+, déclaré `neverForLocation` | au démarrage, et bouton « Autoriser » |
-| `RECORD_AUDIO` | messages vocaux | au premier enregistrement |
+| `RECORD_AUDIO` | messages vocaux **et** appels en direct | au premier enregistrement, ou au premier appel |
+| `MODIFY_AUDIO_SETTINGS` | mode audio d'appel et routage haut‑parleur / écouteur | permission normale, accordée à l'installation |
 
 Sur Android 13+, **les deux** permissions Wi‑Fi sont demandées : `NEARBY_WIFI_DEVICES`
 autorise l'appel des API Wi‑Fi et `ACCESS_FINE_LOCATION` évite que le SSID soit
@@ -1227,9 +1229,12 @@ projet_jpo/
 │   ├── cell_protocol/              # trames COBS + CRC16 (pur C++, testé)
 │   │   ├── include/cell_protocol.h
 │   │   └── src/cell_protocol.cpp
-│   └── cell_core/                  # file de priorité, arbitrage, routage, fragmentation
-│       ├── include/cell_core.h
-│       └── src/cell_core.cpp
+│   ├── cell_core/                  # file de priorité, arbitrage, routage, fragmentation
+│   │   ├── include/cell_core.h
+│   │   └── src/cell_core.cpp
+│   └── cell_call/                  # appels locaux : sessions, isolation cellulaire,
+│       ├── include/cell_call.h     #   trame média binaire (pur C++, testé, sans
+│       └── src/cell_call.cpp       #   aucune dépendance au bus RS485)
 ├── src/
 │   ├── main.cpp                    # AP Wi-Fi + démarrage des services
 │   └── common/
@@ -1244,7 +1249,8 @@ projet_jpo/
 │   ├── test_main.cpp               # point d'entrée Unity (native + ESP32)
 │   ├── test_protocol.cpp           # 7 tests protocole
 │   ├── test_core.cpp               # 19 tests cœur (dont validation atomique du routage)
-│   └── test_reliability.cpp        # 16 tests fiabilité + simulation 2 émetteurs
+│   ├── test_reliability.cpp        # 18 tests fiabilité + simulation 2 émetteurs
+│   └── test_call.cpp               # 28 tests appels locaux + garde-fous « pas de RS485 »
 ├── scripts/
 │   ├── native_toolchain.py         # MinGW fourni par PlatformIO pour env:native
 │   ├── flash_stations.ps1          # compile + téléverse les 3 cartes (mapping de ports)
@@ -1268,10 +1274,13 @@ projet_jpo/
 │           │       ├── text/  (découpage et réassemblage des messages longs)
 │           │       ├── sync/  (politique de l'outbox durable)
 │           │       ├── audio/ (enregistrement, lecture, réassemblage reprenable)
+│           │       ├── call/  (appels locaux : protocole binaire, jitter buffer,
+│           │       │           moteur audio microphone ↔ haut-parleur, garde cellule)
 │           │       ├── wifi/  (SSID, changement de cellule)
 │           │       └── ui/    (ViewModel, écrans Compose, thème)
 │           └── test/java/com/jpo/cellnet/   # tests JVM (chunking, trame binaire,
-│                                            # assemblage vocal, politique outbox)
+│                                            # assemblage vocal, politique outbox,
+│                                            # appels : protocole, jitter, garde cellule)
 └── .github/workflows/
     ├── platformio-build.yml        # tests natifs + 3 firmwares + artefacts
     └── android-build.yml           # APK debug + release + artefact
@@ -1283,22 +1292,34 @@ projet_jpo/
 & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" test -e native
 ```
 
-25 tests couvrent : aller‑retour de trame, rejet CRC, troncature, charge utile
+Les premiers tests couvrent : aller‑retour de trame, rejet CRC, troncature, charge utile
 trop grande, resynchronisation après des octets parasites, flux octet par octet,
 priorités de file, borne de file, anti‑famine audio, jeton (acquisition, budget,
 revendication, saut de nœud mort), routage (déplacement, péremption, aller‑retour
 de présence, données tronquées), enveloppe applicative et réassemblage de
 fragments (désordre, doublon, index invalide, expiration).
 
-Depuis la passe de fiabilisation, la suite en compte **42** : s'y ajoutent le
-suivi d'accusés par fragment (acquittement ciblé, retransmission sélective,
-report tant que le pair est vivant, backoff, échec après 4 essais), la séparation
-file applicative / file de contrôle, les tours de jeton au repos, le
-réassemblage de 12 fragments, deux messages concurrents dans le même contexte,
-le rejet d'un buffer de sortie trop petit, la validation atomique d'une table de
-présence tronquée et la simulation de deux émetteurs concurrents (livraison
-exactement une fois dans les deux sens, équité sous file pleine, récupération
-après perte de jeton, reprise après un pair muet).
+La passe de fiabilisation y ajoute le suivi d'accusés par fragment (acquittement
+ciblé, retransmission sélective, report tant que le pair est vivant, backoff,
+échec après 4 essais), la séparation file applicative / file de contrôle, les
+tours de jeton au repos, le réassemblage de 12 fragments, deux messages
+concurrents dans le même contexte, le rejet d'un buffer de sortie trop petit, la
+validation atomique d'une table de présence tronquée et la simulation de deux
+émetteurs concurrents (livraison exactement une fois dans les deux sens, équité
+sous file pleine, récupération après perte de jeton, reprise après un pair muet).
+
+Les **appels locaux** ajoutent 28 tests (`test/test_call.cpp`) : session à deux
+participants, autorisation A1→A2 / B1→B2 / C1→C2, refus des six paires
+intercellulaires, appel à soi‑même, utilisateur inconnu, utilisateur occupé,
+invitation expirée, déconnexion libérant les ressources, expiration d'un appel
+sans média, limitation de cadence des invitations, borne de la table, validation
+du relais média (uniquement dans une session établie, uniquement entre les deux
+participants), codec de la trame binaire (aller‑retour et rejets) et les quatre
+garde‑fous structurels décrits en 17.12.
+
+**Total : 72 tests natifs** (44 d'origine + 28 d'appel) et **69 tests JVM
+Android** (24 d'origine + 45 d'appel : protocole, tampon de gigue, garde
+cellulaire).
 
 ---
 
@@ -1512,3 +1533,266 @@ Lecture des résultats :
 | `presExp` qui grimpe très vite | régression du flood | noter la cadence et les lignes complètes |
 | `routes` sans utilisateur distant | routage non appris | annonces `ROUTE_STATE` |
 | `retry`/`fail` qui grimpent | transmissions non acquittées | ACK, collisions, jeton |
+
+---
+
+## 17. Appels audio en direct, strictement locaux à une cellule
+
+### 17.1 Ce qui a été ajouté
+
+Deux utilisateurs connectés **au même point d'accès ESP32** peuvent désormais
+s'appeler et se parler en temps réel, comme au téléphone : le microphone de l'un
+est diffusé sur le haut‑parleur (ou l'écouteur) de l'autre, et inversement,
+simultanément.
+
+L'appel est un **ajout indépendant** : les messages textuels, les messages
+vocaux enregistrés, la présence, le répertoire, les accusés, la fragmentation,
+l'outbox, le routage intercellulaire et l'arbitrage RS485 ne sont pas modifiés.
+Aucune route, aucun événement WebSocket, aucune table Room, aucune migration et
+aucun mécanisme de fiabilité n'a été supprimé ni renommé.
+
+### 17.2 Message vocal enregistré ≠ appel en direct
+
+| | Message vocal enregistré | Appel en direct |
+|---|---|---|
+| Nature | fichier fini (AAC‑LC `.m4a`) | flux PCM continu bidirectionnel |
+| Durée | 60 s maximum, puis envoi | illimitée, tant que les deux sont connectés |
+| Transport | **bus RS485** (blocs de 400 octets, `kTypeVoiceBlock`) | **WebSocket binaire local**, jamais le bus |
+| Portée | intercellulaire (A → C possible) | **une seule cellule**, refusé entre cellules |
+| Stockage | fichier sur le téléphone, reprise possible | aucun : rien n'est stocké, ni sur le téléphone ni sur l'ESP32 |
+| Codec | AAC‑LC 16 kHz mono 24 kbit/s | PCM 16 bits signé 8 kHz mono |
+| Fiabilité | CRC32 global + retransmission sélective des blocs | temps réel : gigue absorbée, trous comblés par du silence |
+
+### 17.3 Architecture
+
+```
+Téléphone A1 ──Wi-Fi CELL_SITE_A──> ESP32 SITE_A <──Wi-Fi CELL_SITE_A── Téléphone A2
+        \______ signalisation HTTP /api/call/* ______/
+        \______ média : trames binaires WebSocket, relayées par la station ______/
+```
+
+* **Signalisation** : routes HTTP locales `/api/call/invite|accept|reject|cancel|hangup`
+  et `GET /api/call/state`, plus des événements WebSocket `call_invite`,
+  `call_ringing`, `call_accepted`, `call_rejected`, `call_cancelled`,
+  `call_ended`, `call_timeout`.
+* **Média** : la station **relaie** les trames binaires WebSocket reçues d'un
+  client vers l'autre client de la **même** station. Elle ne les décode pas,
+  ne les stocke pas et ne les met jamais en file d'émission RS485.
+* **Décision** : la table de sessions vit dans `lib/cell_call`, une
+  bibliothèque **plateforme‑neutre qui n'inclut ni `cell_protocol.h` ni
+  `cell_core.h`** : elle ne peut structurellement pas atteindre le bus.
+
+### 17.4 Trame média (WebSocket binaire)
+
+| Offset | Taille | Champ |
+|---|---|---|
+| 0 | 1 | magic `0xA7` (audio d'appel — distinct du `0xA5` des vocaux enregistrés) |
+| 1 | 1 | version (`1`) |
+| 2 | 2 | drapeaux, réservé (`0`) |
+| 4 | 8 | identifiant d'appel, ASCII alphanumérique |
+| 12 | 2 | numéro de séquence (little endian, par sens) |
+| 14 | 2 | longueur de charge (little endian) |
+| 16 | n | PCM 16 bits signé, mono, 8 kHz |
+
+640 octets utiles pour 40 ms ⇒ **25 trames/s et par sens** (≈ 16 kB/s par sens,
+33 kB/s par appel). Le `0xA7` est distinct de **tous** les types de trame du bus
+et de la version du protocole : une trame média ne peut pas être confondue avec
+une trame RS485 (vérifié par test).
+
+### 17.5 Isolation cellulaire (règles appliquées côté station)
+
+Un appel est refusé si :
+
+1. le **demandeur** n'a pas de socket WebSocket actif sur **cette** station ;
+2. le **destinataire** n'a pas de socket WebSocket actif sur cette station ;
+3. la table de routage situe le destinataire sur une **autre** station
+   (`409 cross-cell`) ;
+4. l'un des deux est déjà dans une session (`409 busy`) ;
+5. le demandeur s'appelle lui‑même (`400 self-call`) ;
+6. le destinataire est inconnu (`404 unknown-user`) ou hors ligne
+   (`409 recipient-offline`) ;
+7. le demandeur enchaîne les invitations (`429 call-too-soon`).
+
+L'identité de cellule **déclarée par l'application n'est jamais utilisée** : la
+preuve d'appartenance est le socket WebSocket réellement connecté à la station.
+La vérification est donc **serveur** (la station refuse) **et** cliente (le
+bouton d'appel est désactivé hors cellule, avec le motif affiché).
+
+### 17.6 Ports et protocoles
+
+| Usage | Transport | Port |
+|---|---|---|
+| Signalisation d'appel | HTTP POST/GET (JSON) | **8080** (existant) |
+| Événements d'appel | WebSocket texte | **8081** (existant) |
+| Audio de l'appel | WebSocket **binaire** | **8081** (existant) |
+
+Aucun port nouveau n'est ouvert, aucun service externe n'est contacté : les
+appels fonctionnent **sans Internet**.
+
+
+### 17.7 Gigue, pertes et contrôle de flux
+
+* **Gigue** : un `JitterBuffer` réordonne les trames ; l'origine du flux est la
+  première trame reçue. Un trou est comblé par du **silence** dès que 3 trames
+  plus récentes attendent, afin que l'horloge de lecture ne s'arrête jamais. Une
+  trame arrivée après le passage de son créneau est **abandonnée** (le flux ne
+  se décale pas).
+* **Latence bornée** : le tampon est plafonné à 12 trames (480 ms) ; les plus
+  anciennes sont écartées en premier.
+* **Pertes** : pas de retransmission (ce serait trop tard pour du temps réel) ;
+  la perte est masquée par le comblement de silence, et comptée
+  (`audioSilent`, `audioRejected` dans `/api/health`).
+* **Contrôle de flux** : `AudioTrack.write()` en mode bloquant cadence
+  naturellement la boucle de lecture à une trame par 40 ms ; la capture suit la
+  même cadence. La station relaie sans bufferiser.
+* **Micro coupé** : les trames sont remplacées par du silence et **continuent
+  d'être envoyées** — le correspondant entend du silence (pas une coupure) et la
+  surveillance de flux de la station reste valide.
+* **Surveillance** : une invitation sans réponse expire en 30 s ; un appel établi
+  sans aucun média pendant 20 s (station) / 8 s (téléphone) est terminé
+  proprement des deux côtés.
+
+### 17.8 Interface Android
+
+* **Bouton d'appel** dans l'en‑tête de la conversation, désactivé hors cellule.
+* **Écran d'appel plein écran** : nom du contact, état (« Appel en cours… »,
+  « Appel entrant », « En communication »), durée de l'appel, mention « Appel
+  local à la cellule uniquement ».
+* **Appel entrant** : boutons « Accepter » / « Refuser ».
+* **Appel établi** : boutons micro (muet), haut‑parleur / écouteur, et
+  « Raccrocher » (ou « Annuler » pendant la sonnerie).
+* **Journal** : une ligne discrète au‑dessus du champ de saisie rappelle le
+  dernier appel avec ce contact (état, durée, heure). Les appels sont
+  journalisés dans la table Room `calls` — **métadonnées uniquement, jamais
+  l'audio**.
+* Les conversations, les messages et les vocaux existants ne sont ni déplacés ni
+  remplacés : l'appel est un écran superposé qui disparaît à la fin de l'appel.
+
+### 17.9 Permissions et cycle de vie
+
+| Permission | Usage |
+|---|---|
+| `RECORD_AUDIO` | capture du microphone (déjà nécessaire aux vocaux) |
+| `MODIFY_AUDIO_SETTINGS` | mode `MODE_IN_COMMUNICATION`, routage haut‑parleur / écouteur |
+
+* La permission microphone est demandée **au moment de l'appel** si elle n'est
+  pas encore accordée ; en cas de refus, un message explique que l'appel est
+  impossible et rien n'est ouvert.
+* Le focus audio est demandé (`AUDIOFOCUS_GAIN_TRANSIENT`) à l'ouverture de
+  l'appel et rendu à la fermeture ; le mode audio est remis à `MODE_NORMAL`.
+* Une seule session audio à la fois : lancer un appel pendant un enregistrement
+  (ou l'inverse) est refusé avec un message explicite.
+* Perte du WebSocket, changement de cellule, `onCleared()` : le moteur audio est
+  libéré, la session est fermée côté station (déconnexion) et l'autre
+  participant est notifié.
+* **Arrière‑plan** : l'appel est maintenu tant que l'activité vit. Pour un appel
+  qui survit à la mise en arrière‑plan, un service de premier plan
+  (`foregroundServiceType="microphone"`, notification persistante,
+  `FOREGROUND_SERVICE_MICROPHONE` sur Android 14) serait nécessaire ; **il n'est
+  pas implémenté** (voir 17.13).
+
+### 17.10 Dépendances ajoutées
+
+**Aucune dépendance nouvelle.** Le côté Android utilise uniquement le framework
+(`AudioRecord`, `AudioTrack`, `AudioManager`, `AudioFocusRequest`), OkHttp
+(déjà présent pour le WebSocket) et Room (déjà présent). Côté firmware, seuls
+`WebSockets` et `ArduinoJson` déjà utilisés sont employés. Les versions Kotlin,
+Gradle, AGP, SDK et Room sont inchangées.
+
+### 17.11 Compilation et tests
+
+```powershell
+# 1. Tests natifs (44 tests d'origine + 28 tests d'appel = 72)
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" test -e native
+
+# 2. Les trois firmwares
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e site_a -e site_b -e site_c
+
+# 3. Application Android (tests JVM + APK)
+cd mobile
+gradle testDebugUnitTest assembleDebug assembleRelease
+```
+
+Attendu : `72 test cases: 72 succeeded`, `3 succeeded` (RAM 24,1 %, Flash
+63,8 %), `BUILD SUCCESSFUL` avec **69 tests JVM, 0 échec**.
+
+
+### 17.12 Preuve que l'audio d'appel ne passe pas par le RS485
+
+Cette propriété n'est pas seulement documentée : elle est **testée**.
+
+**Garde‑fous structurels** (dans `test/test_call.cpp`, exécutés par
+`pio test -e native`) :
+
+| Test | Ce qu'il vérifie |
+|---|---|
+| `testCallModuleDoesNotDependOnTheBusLibraries` | `cell_call.h` / `cell_call.cpp` n'incluent ni `cell_protocol.h` ni `cell_core.h`, et ne mentionnent aucun symbole du bus (`FrameQueue`, `BusArbiter`, `AckTracker`, `submitAppPayload`, `cobsEncode`, `crc16Ccitt`) |
+| `testStationCallHandlersNeverSubmitToTheMesh` | les gestionnaires `/api/call/*` et le relais média de `app_server.cpp` ne contiennent **aucun** `submitAppPayload`, aucun `queue_.push`, et aucun nouveau type de trame (`kTypeCall`, `kTypeAudio` absents du fichier) |
+| `testMeshNodeAndProtocolWereNotTouchedByTheCallFeature` | `mesh_node.h`, `mesh_node.cpp` et `cell_protocol.h` ne contiennent **aucune** référence à `CallTable`, `kCallAudio`, `handleCall`, `call_audio` ou `cell_call.h` |
+| `testCallAudioMagicCannotBeMistakenForABusFrame` | le magic `0xA7` diffère de **tous** les `MessageType`, de `kProtocolVersion` et du délimiteur COBS `0x00` ; une trame média (656 o) est plus grande que la plus grande trame de bus possible (491 o) |
+
+**Compteurs d'exécution** (`/api/health` → `calls`) : `audioFrames`,
+`audioRelayed`, `audioRejected`, `audioSilent`, `transport =
+"websocket-binary"`. Il n'existe **aucun** compteur d'appel dans le bloc `bus` :
+par construction, un appel ne peut rien y incrémenter.
+
+**Vérification manuelle** possible : pendant un appel actif, le moniteur série
+d'une station ne doit montrer **aucune** émission sur le bus (`tx` stable), les
+LED verte/rouge RS485 doivent rester éteintes, et `GET /api/health` doit
+augmenter `calls.audioRelayed` sans que `bus.sent` bouge.
+
+### 17.13 Limites connues
+
+* **Appel en arrière‑plan** : non pris en charge (pas de service de premier
+  plan). Si l'application est mise en arrière‑plan puis tuée par le système,
+  l'appel se termine ; la station libère la session à la déconnexion du socket.
+* **Deux participants maximum** par appel (pas de conférence).
+* **4 sessions simultanées** au maximum par station (`kMaxCallSessions`), soit
+  deux appels en parallèle ; au‑delà, `503 call-table-full`.
+* **Qualité audio** : PCM 8 kHz mono 16 bits (qualité téléphonique). Aucun
+  codec large bande (Opus) n'est utilisé, pour ne dépendre d'aucune
+  bibliothèque supplémentaire.
+* **Pas de chiffrement** : comme le reste du prototype, l'audio circule en clair
+  sur le Wi‑Fi local. Aucun chiffrement n'a été implémenté, donc aucun
+  chiffrement n'est annoncé.
+* **Pas d'écho annulation (AEC)** : l'usage du haut‑parleur sans écouteur peut
+  produire un écho sur certains appareils. `VOICE_COMMUNICATION` active
+  l'annulation d'écho matérielle quand elle existe.
+* **Un appel ne survit pas** à un changement de cellule ni à un redémarrage de
+  la station : la session est fermée et les deux participants sont notifiés.
+* Le journal des appels n'est pas purgé automatiquement (contrairement aux
+  transferts) : la méthode `purgeOlderThan` existe mais n'est pas planifiée.
+
+### 17.14 Validation matérielle restant à faire
+
+Aucun téléphone, aucune carte ESP32 et aucune liaison Wi‑Fi réelle n'étant
+accessible depuis cet environnement, **aucun appel réel n'a été passé**. Ce qui
+reste à valider sur banc :
+
+1. **Appel autorisé (même cellule)** — deux téléphones sur `CELL_SITE_A`,
+   utilisateurs A1 et A2 : A1 appelle A2, A2 accepte, la conversation
+   bidirectionnelle doit être audible dans les deux sens.
+2. **Appel refusé (cellules différentes)** — A1 sur `CELL_SITE_A` appelle B1 sur
+   `CELL_SITE_B` : l'appel doit être refusé avec « le correspondant est sur une
+   autre cellule », **sans aucune émission RS485** (vérifier les LED et
+   `bus.sent`).
+3. **Refus / occupation** — A2 refuse : A1 voit « Appel refusé ». A2 déjà en
+   appel : A3 obtient « Correspondant déjà en communication ».
+4. **Non‑régression messagerie** — pendant et après un appel, vérifier que les
+   textes et les vocaux fonctionnent toujours **en local** et **entre cellules**
+   (A→B, A→C, B→C), avec accusés « livré » puis « lu ».
+5. **Robustesse** — couper le Wi‑Fi pendant un appel (doit se terminer proprement
+   des deux côtés) ; éteindre la station pendant un appel ; laisser sonner sans
+   répondre (expiration à 30 s) ; appeler en micro coupé (le correspondant doit
+   entendre du silence et l'appel doit rester actif).
+6. **Charge** — mesurer `calls.audioRelayed` / `calls.audioSilent`,
+   `system.heapMin` et `maxLoopUs` de `/api/health` pendant un appel de 5 min, et
+   vérifier qu'aucun message ni accusé n'est perdu en parallèle.
+7. **Appareils** — tester sur au moins deux modèles Android (routage
+   écouteur / haut‑parleur, annulation d'écho, latence perçue).
+
+Aucun de ces points n'est couvert par un test automatisé : les tests fournis
+vérifient la logique de session, l'isolation cellulaire, le format des trames,
+le tampon de gigue et l'absence de dépendance au bus — **pas** la qualité audio
+sur matériel réel.
+

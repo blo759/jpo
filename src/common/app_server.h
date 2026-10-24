@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <WebSocketsServer.h>
 
+#include "cell_call.h"
 #include "cell_core.h"
 #include "mesh_node.h"
 #include "station_config.h"
@@ -12,9 +13,14 @@
 namespace cell {
 
 // Local application service exposed by each station:
-//   * HTTP REST on servicePort  : identity, presence, text, voice blocks
+//   * HTTP REST on servicePort  : identity, presence, text, voice blocks, calls
 //   * WebSocket on wsPort       : real time events (incoming message, receipts,
-//                                 voice blocks, presence updates)
+//                                 voice blocks, presence updates) and the binary
+//                                 media channel of a live local call
+//
+// Real time calls are strictly local to the cell: the signalling never reaches
+// the mesh and the audio is relayed as binary WebSocket frames between the two
+// sockets of *this* station. See lib/cell_call for the session rules.
 class AppServer {
  public:
   AppServer(MeshNode& mesh, const StationConfig& config);
@@ -39,6 +45,33 @@ class AppServer {
   void handleVoiceBlock();
   void handleVoiceFeedback();
   void handleNotFound();
+
+  // Real time calls, local cell only. Signalling over HTTP, media over the
+  // binary WebSocket channel. None of these methods touches the mesh.
+  void handleCallInvite();
+  void handleCallAccept();
+  void handleCallReject();
+  void handleCallCancel();
+  void handleCallHangup();
+  void handleCallState();
+  void handleCallAudio(uint8_t clientNumber, uint8_t* payload, size_t length);
+  void serviceCallTimeouts();
+  void notifyCallEnded(const char* userId, const char* callId, const char* peer,
+                       const char* event, const char* reason);
+  // Used when the participants are no longer known (an expired invitation): the
+  // event carries the call id, every local client filters on it.
+  void broadcastCallEvent(const char* event, const char* callId, const char* reason);
+  void endCallsForUser(const char* userId, const char* event, const char* reason);
+  void replyCallStatus(cell::CallStatus status);
+  void pushCallEvent(const char* userId, const char* event, const CallSession& session,
+                     const char* reason, const char* extraJson);
+
+  // Membership probe handed to the call table: a user is local when one of this
+  // station's WebSocket clients is currently bound to that identifier. That is
+  // the only proof that the user really is on this cell, and it is what makes a
+  // cross cell call impossible even if the client lies about its cell.
+  static bool probeLocalUser(void* context, const char* userId);
+  bool hasLocalSocket(const char* userId) const;
 
   void handleSocketEvent(uint8_t clientNumber, uint8_t type, uint8_t* payload, size_t length);
   void bindSocketToUser(uint8_t clientNumber, const char* userId);
@@ -65,6 +98,14 @@ class AppServer {
   char socketUsers_[WEBSOCKETS_SERVER_CLIENT_MAX][kMaxUserIdLength];
   uint32_t socketEvents_ = 0;
   uint32_t pushedEvents_ = 0;
+
+  // Call sessions of this cell. Bounded and statically allocated; it is never
+  // shared with the mesh, so a call can never leave the cell.
+  CallTable calls_;
+  uint32_t callAudioFrames_ = 0;     // binary frames received from clients
+  uint32_t callAudioRelayed_ = 0;    // frames really forwarded to the peer
+  uint32_t callAudioRejected_ = 0;   // frames refused (bad format, no session)
+  uint32_t callAudioSilent_ = 0;     // relays that found no peer socket
 };
 
 }  // namespace cell

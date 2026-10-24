@@ -28,17 +28,23 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.CellTower
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VolumeOff
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -65,6 +71,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -76,12 +83,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.jpo.cellnet.call.CallPhase
+import com.jpo.cellnet.data.CallEntity
+import com.jpo.cellnet.data.CallRecordState
 import com.jpo.cellnet.data.ConversationEntity
 import com.jpo.cellnet.data.MessageEntity
 import com.jpo.cellnet.data.MessageState
 import com.jpo.cellnet.net.Cells
 import com.jpo.cellnet.net.DirectoryUser
 import com.jpo.cellnet.wifi.SsidStatus
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -101,14 +112,47 @@ fun CellNetRoot(
     state: UiState,
     conversations: List<ConversationEntity>,
     messages: List<MessageEntity>,
+    callHistory: List<CallEntity>,
     viewModel: AppViewModel
 ) {
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
 
     val recordPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted -> if (granted) viewModel.startRecording() }
+
+    // A live call needs the microphone as well. The permission is requested at
+    // the moment the user actually calls, and the call is placed on the answer.
+    var pendingCall by remember { mutableStateOf<Pair<String, String>?>(null) }
+    val callPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val target = pendingCall
+        pendingCall = null
+        if (granted && target != null) {
+            viewModel.startCall(target.first, target.second)
+        } else if (!granted) {
+            scope.launch {
+                snackbarHostState.showSnackbar(
+                    "Microphone refusé : un appel en direct est impossible"
+                )
+            }
+        }
+    }
+
+    val placeCall: (String, String) -> Unit = { peerId, peerName ->
+        val granted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            viewModel.startCall(peerId, peerName)
+        } else {
+            pendingCall = peerId to peerName
+            callPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     val wifiPermissions = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -157,8 +201,10 @@ fun CellNetRoot(
                 state.activePeer != null -> ChatScreen(
                     state = state,
                     messages = messages,
+                    lastCall = callHistory.firstOrNull { it.peerId == state.activePeer },
                     onBack = viewModel::closeConversation,
                     onSend = viewModel::sendText,
+                    onCall = { placeCall(state.activePeer.orEmpty(), state.activePeerName.orEmpty()) },
                     onStartRecording = {
                         val granted = ContextCompat.checkSelfPermission(
                             context, Manifest.permission.RECORD_AUDIO
@@ -177,6 +223,17 @@ fun CellNetRoot(
                     onRequestWifiPermissions = requestWifiPermissions
                 )
             }
+
+            // The call screen covers the application while a call is up: it is the
+            // only way to reach the hang up / mute / speaker controls.
+            CallOverlay(
+                call = state.call,
+                onAccept = viewModel::acceptCall,
+                onReject = viewModel::rejectCall,
+                onHangUp = viewModel::hangupCall,
+                onToggleMute = viewModel::toggleCallMute,
+                onToggleSpeaker = viewModel::toggleCallSpeaker
+            )
         }
     }
 }
@@ -755,8 +812,10 @@ private fun CellScreen(
 private fun ChatScreen(
     state: UiState,
     messages: List<MessageEntity>,
+    lastCall: CallEntity?,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
+    onCall: () -> Unit,
     onStartRecording: () -> Unit,
     onStopRecording: () -> Unit,
     onCancelRecording: () -> Unit,
@@ -770,6 +829,10 @@ private fun ChatScreen(
             listState.animateScrollToItem(messages.lastIndex)
         }
     }
+
+    // A live call is possible only between two users of the same cell: the
+    // button is disabled (with the reason in the subtitle) otherwise.
+    val callAllowed = state.cellSite != null && state.httpConnected && state.wsConnected
 
     Scaffold(
         topBar = {
@@ -792,24 +855,43 @@ private fun ChatScreen(
                             style = MaterialTheme.typography.labelSmall
                         )
                     }
+                },
+                actions = {
+                    IconButton(onClick = onCall, enabled = callAllowed) {
+                        Icon(
+                            Icons.Default.Call,
+                            contentDescription = if (callAllowed) {
+                                "Appeler (même cellule)"
+                            } else {
+                                "Appel indisponible hors cellule"
+                            }
+                        )
+                    }
                 }
             )
         },
         bottomBar = {
-            Composer(
-                state = state,
-                draft = draft,
-                onDraft = { draft = it },
-                onSend = {
-                    if (draft.isNotBlank()) {
-                        onSend(draft)
-                        draft = ""
-                    }
-                },
-                onStartRecording = onStartRecording,
-                onStopRecording = onStopRecording,
-                onCancelRecording = onCancelRecording
-            )
+            Column {
+                // Journal of the last live call with this contact. Informative
+                // only: it never replaces the messages.
+                if (lastCall != null) {
+                    CallHistoryRow(lastCall)
+                }
+                Composer(
+                    state = state,
+                    draft = draft,
+                    onDraft = { draft = it },
+                    onSend = {
+                        if (draft.isNotBlank()) {
+                            onSend(draft)
+                            draft = ""
+                        }
+                    },
+                    onStartRecording = onStartRecording,
+                    onStopRecording = onStopRecording,
+                    onCancelRecording = onCancelRecording
+                )
+            }
         }
     ) { padding ->
         if (messages.isEmpty()) {
@@ -1055,4 +1137,169 @@ private fun stationLabel(state: UiState): String = when {
     state.httpConnected -> "joignable sur ${state.cellIp}"
     state.cellSite != null -> "inaccessible (${state.cellIp ?: "adresse inconnue"})"
     else -> "—"
+}
+
+// ---------------------------------------------------------------------------
+// Live calls
+// ---------------------------------------------------------------------------
+
+/** One line summarising the last live call with a contact. */
+@Composable
+private fun CallHistoryRow(call: CallEntity) {
+    val label = when (call.state) {
+        CallRecordState.ACTIVE -> "Appel en cours"
+        CallRecordState.MISSED -> "Appel manqué"
+        CallRecordState.REFUSED -> "Appel refusé"
+        CallRecordState.FAILED -> "Appel échoué"
+        CallRecordState.DIALING, CallRecordState.RINGING -> "Appel en cours…"
+        else -> if (call.direction == "out") "Appel sortant" else "Appel entrant"
+    }
+    val duration = if (call.durationMs > 0L) " · ${formatDuration(call.durationMs)}" else ""
+    Surface(tonalElevation = 1.dp) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.Call,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "$label$duration · ${formatTime(call.startedAt)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/** Status line shown on the call screen. */
+private fun callStatusLabel(call: CallUiState): String = when (call.phase) {
+    CallPhase.DIALING -> "Appel en cours…"
+    CallPhase.RINGING -> "Appel entrant"
+    CallPhase.ACTIVE -> "En communication"
+    CallPhase.ENDED, CallPhase.IDLE -> call.detail ?: ""
+}
+
+
+
+/**
+ * Full screen call interface. It only appears while a call exists, so it can
+ * never hide the rest of the application permanently.
+ *
+ * The call is local to the cell: the station relays the audio between the two
+ * phones of the same access point, and nothing is sent to the RS485 bus.
+ */
+@Composable
+private fun CallOverlay(
+    call: CallUiState,
+    onAccept: () -> Unit,
+    onReject: () -> Unit,
+    onHangUp: () -> Unit,
+    onToggleMute: () -> Unit,
+    onToggleSpeaker: () -> Unit
+) {
+    if (!call.busy) return
+    val incomingRinging = call.incoming && call.phase == CallPhase.RINGING
+
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxSize()
+    ) {
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Avatar(call.peerName ?: call.peerId ?: "?")
+            Spacer(Modifier.height(16.dp))
+            Text(
+                call.peerName ?: call.peerId ?: "Appel",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                callStatusLabel(call),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                "Appel local à la cellule uniquement",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            if (call.phase == CallPhase.ACTIVE) {
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    formatDuration(call.durationMs),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    if (call.speaker) "Haut-parleur" else "Écouteur",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Spacer(Modifier.height(32.dp))
+
+            if (incomingRinging) {
+                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    Button(onClick = onAccept) {
+                        Icon(Icons.Default.Call, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Accepter")
+                    }
+                    OutlinedButton(onClick = onReject) {
+                        Icon(Icons.Default.CallEnd, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Refuser")
+                    }
+                }
+            } else {
+                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                    IconButton(onClick = onToggleMute) {
+                        Icon(
+                            if (call.muted) Icons.Default.MicOff else Icons.Default.Mic,
+                            contentDescription =
+                                if (call.muted) "Réactiver le micro" else "Couper le micro"
+                        )
+                    }
+                    IconButton(onClick = onToggleSpeaker) {
+                        Icon(
+                            if (call.speaker) Icons.Default.VolumeUp else Icons.Default.VolumeOff,
+                            contentDescription =
+                                if (call.speaker) "Passer à l'écouteur" else "Passer au haut-parleur"
+                        )
+                    }
+                }
+                Spacer(Modifier.height(20.dp))
+                Button(
+                    onClick = onHangUp,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFFD32F2F),
+                        contentColor = Color.White
+                    )
+                ) {
+                    Icon(Icons.Default.CallEnd, contentDescription = null)
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (call.phase == CallPhase.DIALING) "Annuler" else "Raccrocher")
+                }
+            }
+        }
+    }
 }

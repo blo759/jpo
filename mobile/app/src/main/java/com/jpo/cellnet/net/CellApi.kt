@@ -139,6 +139,36 @@ class CellApi {
         post("/api/voice/feedback", json)
     }
 
+    // -----------------------------------------------------------------------
+    // Live calls. Signalling only: the audio itself travels as binary WebSocket
+    // frames, never through these endpoints and never through the RS485 bus.
+    // -----------------------------------------------------------------------
+
+    suspend fun callInvite(json: String): JSONObject = withContext(Dispatchers.IO) {
+        post("/api/call/invite", json)
+    }
+
+    suspend fun callAccept(json: String): JSONObject = withContext(Dispatchers.IO) {
+        post("/api/call/accept", json)
+    }
+
+    suspend fun callReject(json: String): JSONObject = withContext(Dispatchers.IO) {
+        post("/api/call/reject", json)
+    }
+
+    suspend fun callCancel(json: String): JSONObject = withContext(Dispatchers.IO) {
+        post("/api/call/cancel", json)
+    }
+
+    suspend fun callHangup(json: String): JSONObject = withContext(Dispatchers.IO) {
+        post("/api/call/hangup", json)
+    }
+
+    /** Diagnostic state of the calls of this cell. */
+    suspend fun callState(userId: String): JSONObject = withContext(Dispatchers.IO) {
+        JSONObject(get("/api/call/state?userId=$userId"))
+    }
+
     private fun get(path: String): String {
         if (baseUrl.isBlank()) throw IOException("station URL not configured")
         val request = Request.Builder().url(baseUrl + path).get().build()

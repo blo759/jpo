@@ -9,8 +9,15 @@ import com.jpo.cellnet.audio.VoiceAssembler
 import com.jpo.cellnet.audio.VoicePlayer
 import com.jpo.cellnet.audio.VoiceProtocol
 import com.jpo.cellnet.audio.VoiceRecorder
+import com.jpo.cellnet.call.CallAudioEngine
+import com.jpo.cellnet.call.CallPhase
+import com.jpo.cellnet.call.CallProtocol
+import com.jpo.cellnet.call.CallRefusal
+import com.jpo.cellnet.call.CallSessionPolicy
 import com.jpo.cellnet.data.AppDatabase
 import com.jpo.cellnet.data.BlockSet
+import com.jpo.cellnet.data.CallEntity
+import com.jpo.cellnet.data.CallRecordState
 import com.jpo.cellnet.data.ConversationEntity
 import com.jpo.cellnet.data.MessageEntity
 import com.jpo.cellnet.data.MessageState
@@ -68,6 +75,30 @@ enum class CellStatus {
     CONNECTED            // cell identified and its service answers
 }
 
+/**
+ * Live call state, as displayed by the interface. A call is strictly local to
+ * the cell: [phase] can only reach ACTIVE through a station that accepted the
+ * two participants of *its own* cell.
+ */
+data class CallUiState(
+    val phase: CallPhase = CallPhase.IDLE,
+    val callId: String? = null,
+    val peerId: String? = null,
+    val peerName: String? = null,
+    val incoming: Boolean = false,
+    val muted: Boolean = false,
+    val speaker: Boolean = true,
+    val startedAt: Long = 0L,
+    val connectedAt: Long? = null,
+    /** Refreshed once per second while the call is established. */
+    val durationMs: Long = 0L,
+    val reason: String? = null,
+    val detail: String? = null
+) {
+    val busy: Boolean get() = phase != CallPhase.IDLE
+    val live: Boolean get() = phase == CallPhase.ACTIVE
+}
+
 data class UiState(
     val ready: Boolean = false,
     val profile: UserProfile? = null,
@@ -99,6 +130,8 @@ data class UiState(
     val nearCells: List<Pair<String, Int>> = emptyList(),
     val wifiMessage: String? = null,
     val lastDisconnect: String? = null,
+    // Live call (local cell only)
+    val call: CallUiState = CallUiState(),
     val error: String? = null,
     val info: String? = null
 ) {
@@ -113,11 +146,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val store = UserProfileStore(application)
     private val dao = AppDatabase.get(application).chatDao()
     private val transferDao = AppDatabase.get(application).transferDao()
+    private val callDao = AppDatabase.get(application).callDao()
     private val api = CellApi()
     private val recorder = VoiceRecorder(application)
     private val player = VoicePlayer()
     private val assembler = VoiceAssembler(application)
     private val wifi = CellWifi(application)
+
+    /** Audio path of a live call. Microphone to speaker, local IP only. */
+    private val callAudio = CallAudioEngine(application)
+
+    /** Sequence of the outgoing media stream, per call. */
+    @Volatile
+    private var callSendSequence = 0
+
+    /** Last time a media frame was pushed to the station (watchdog). */
+    @Volatile
+    private var callLastSendAt = 0L
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -131,6 +176,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (peer.isNullOrBlank()) flowOf(emptyList()) else dao.observeMessages(peer)
     }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
+    /** Journal of the live calls, most recent first (metadata only, no audio). */
+    val callHistory: StateFlow<List<CallEntity>> = callDao.observeRecent()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
     private val socketListener = object : CellSocket.Listener {
         override fun onSocketOpen() {
             _state.update { it.copy(wsConnected = true, error = null) }
@@ -138,6 +187,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
         override fun onSocketClosed(reason: String) {
             _state.update { it.copy(wsConnected = false, lastDisconnect = reason) }
+            // The media channel is gone: a call cannot survive it. The station
+            // releases the session on its side at the same moment.
+            if (_state.value.call.busy) {
+                finishCall("Connexion perdue : appel terminé", "disconnected")
+            }
         }
 
         override fun onSocketText(text: String) {
@@ -145,7 +199,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun onSocketBinary(bytes: ByteArray) {
-            handleVoiceBlockData(bytes)
+            // 0xA7 is a live call media frame, 0xA5 a recorded voice block. The
+            // two features are dispatched explicitly so they can never mix.
+            if (CallProtocol.isCallFrame(bytes)) handleCallAudioFrame(bytes)
+            else handleVoiceBlockData(bytes)
         }
     }
 
@@ -155,6 +212,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var recordingJob: Job? = null
     private var monitorJob: Job? = null
     private var outboxJob: Job? = null
+    private var callJob: Job? = null
     private var outboxResumed = false
 
     private val detectionMutex = Mutex()
@@ -622,6 +680,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Clears every station-related value so an old cell is never displayed. */
     private fun clearStation(status: CellStatus, detail: String?) {
+        // A live call cannot outlive its cell: the media channel is the local
+        // station itself, so the call is closed before the socket goes away.
+        if (_state.value.call.busy) {
+            finishCall("Cellule perdue : appel terminé", "disconnected")
+        }
         socket.disconnect()
         wifi.unbindProcess()
         _state.update {
@@ -1195,6 +1258,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun startRecording() {
         if (recorder.isRecording) return
         if (_state.value.activePeer == null) return
+        // The microphone belongs to the call while a call is up.
+        if (_state.value.call.busy) {
+            _state.update { it.copy(error = "Terminez l'appel avant d'enregistrer un vocal") }
+            return
+        }
         val started = runCatching { recorder.start() }.isSuccess
         if (!started) {
             _state.update {
@@ -1643,6 +1711,403 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // -----------------------------------------------------------------------
+    // Live calls (local cell only)
+    //
+    // Signalling goes through the dedicated /api/call/* routes of the station.
+    // The audio itself is sent as binary WebSocket frames that the ESP32 of this
+    // cell relays to the other phone of the same cell: no RS485 frame, no mesh
+    // routing, no server, no Internet.
+    // -----------------------------------------------------------------------
+
+    /**
+     * Places a call. The local guard refuses immediately what the station would
+     * refuse anyway (cross cell, busy, no cell), so the user gets an explanation
+     * instead of a silent failure.
+     */
+    fun startCall(peerId: String, peerName: String) {
+        val profile = _state.value.profile ?: return
+        val snapshot = _state.value
+        val peerStation = snapshot.users.firstOrNull { it.id == peerId }?.station
+        val refusal = CallSessionPolicy.canStart(
+            phase = snapshot.call.phase,
+            localCell = snapshot.cellSite,
+            peerStation = peerStation,
+            peerId = peerId,
+            selfId = profile.userId,
+            stationConnected = snapshot.httpConnected && snapshot.wsConnected
+        )
+        if (refusal != CallRefusal.NONE) {
+            _state.update { it.copy(error = CallSessionPolicy.refusalMessage(refusal)) }
+            return
+        }
+        if (recorder.isRecording) {
+            _state.update { it.copy(error = "Terminez l'enregistrement avant d'appeler") }
+            return
+        }
+
+        val callId = CallProtocol.newCallId()
+        _state.update {
+            it.copy(
+                call = CallUiState(
+                    phase = CallPhase.DIALING,
+                    callId = callId,
+                    peerId = peerId,
+                    peerName = peerName,
+                    incoming = false,
+                    speaker = true,
+                    startedAt = System.currentTimeMillis(),
+                    detail = "Appel en cours…"
+                ),
+                error = null
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            recordCallStart(callId, peerId, peerName, "out")
+            val payload = JSONObject()
+                .put("callId", callId)
+                .put("from", profile.userId)
+                .put("to", peerId)
+                .toString()
+            try {
+                api.callInvite(payload)
+                startCallWatchdog()
+            } catch (error: ApiException) {
+                finishCall(callRefusalMessage(error.status), error.status)
+            } catch (error: Exception) {
+                finishCall(describe(error), "error")
+            }
+        }
+    }
+
+    /** Answers an incoming call: the media channel opens on both sides. */
+    fun acceptCall() {
+        val call = _state.value.call
+        if (!CallSessionPolicy.canAnswer(call.phase)) return
+        val profile = _state.value.profile ?: return
+        val callId = call.callId ?: return
+        _state.update { it.copy(call = it.call.copy(detail = "Connexion…")) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val payload = JSONObject().put("callId", callId).put("userId", profile.userId).toString()
+            try {
+                api.callAccept(payload)
+            } catch (error: Exception) {
+                finishCall("Appel impossible : ${describe(error)}", "error")
+            }
+        }
+    }
+
+    /** Refuses an incoming call. */
+    fun rejectCall() {
+        val call = _state.value.call
+        if (!CallSessionPolicy.canAnswer(call.phase)) return
+        val profile = _state.value.profile ?: return
+        val callId = call.callId ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                api.callReject(
+                    JSONObject().put("callId", callId).put("userId", profile.userId).toString()
+                )
+            }
+        }
+        finishCall("Appel refusé", "rejected")
+    }
+
+    /** Cancels a ringing invitation or hangs up an established call. */
+    fun hangupCall() {
+        val call = _state.value.call
+        val profile = _state.value.profile
+        val callId = call.callId
+        val cancelling = call.phase == CallPhase.DIALING
+        if (callId != null && profile != null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                val payload =
+                    JSONObject().put("callId", callId).put("userId", profile.userId).toString()
+                runCatching { if (cancelling) api.callCancel(payload) else api.callHangup(payload) }
+            }
+        }
+        finishCall(
+            if (cancelling) "Appel annulé" else "Appel terminé",
+            if (cancelling) "cancelled" else "hangup"
+        )
+    }
+
+    fun toggleCallMute() {
+        val muted = !_state.value.call.muted
+        callAudio.setMuted(muted)
+        _state.update { it.copy(call = it.call.copy(muted = muted)) }
+    }
+
+    fun toggleCallSpeaker() {
+        val speaker = !_state.value.call.speaker
+        callAudio.setSpeaker(speaker)
+        _state.update { it.copy(call = it.call.copy(speaker = speaker)) }
+    }
+
+    /**
+     * Applies a station call event. Events carrying another call id are ignored,
+     * so a late event can never disturb the call in progress.
+     */
+    private fun handleCallEvent(json: JSONObject) {
+        val type = json.optString("type")
+        val callId = json.optString("callId")
+        val reason = json.optString("reason").ifBlank { null }
+        val current = _state.value.call
+        val profile = _state.value.profile
+
+        when (type) {
+            "call_invite" -> {
+                val from = json.optString("from")
+                if (from.isBlank()) return
+                if (current.busy) {
+                    // Already in a call: answer busy, leave the current one alone.
+                    if (callId.isNotBlank() && profile != null) {
+                        viewModelScope.launch(Dispatchers.IO) {
+                            runCatching {
+                                api.callReject(
+                                    JSONObject().put("callId", callId)
+                                        .put("userId", profile.userId).toString()
+                                )
+                            }
+                        }
+                    }
+                    _state.update {
+                        it.copy(info = "Appel entrant refusé : communication en cours")
+                    }
+                    return
+                }
+                val phase = CallSessionPolicy.applyEvent(current.phase, type, isCaller = false)
+                if (phase != CallPhase.RINGING) return
+                val name = _state.value.users.firstOrNull { it.id == from }?.name ?: from
+                _state.update {
+                    it.copy(
+                        call = CallUiState(
+                            phase = CallPhase.RINGING,
+                            callId = callId,
+                            peerId = from,
+                            peerName = name,
+                            incoming = true,
+                            speaker = true,
+                            startedAt = System.currentTimeMillis(),
+                            detail = "Appel entrant"
+                        ),
+                        error = null
+                    )
+                }
+                viewModelScope.launch(Dispatchers.IO) { recordCallStart(callId, from, name, "in") }
+                startCallWatchdog()
+            }
+
+            "call_ringing" -> {
+                if (current.callId != callId || current.phase != CallPhase.DIALING) return
+                _state.update { it.copy(call = it.call.copy(detail = "Appel en cours…")) }
+            }
+
+            "call_accepted" -> {
+                if (current.callId != callId) return
+                val phase =
+                    CallSessionPolicy.applyEvent(current.phase, type, isCaller = !current.incoming)
+                if (phase != CallPhase.ACTIVE) return
+                val now = System.currentTimeMillis()
+                _state.update {
+                    it.copy(
+                        call = it.call.copy(
+                            phase = CallPhase.ACTIVE,
+                            connectedAt = now,
+                            durationMs = 0L,
+                            detail = "En communication"
+                        )
+                    )
+                }
+                openCallMedia(callId)
+                startCallWatchdog()
+            }
+
+            "call_rejected", "call_cancelled", "call_ended", "call_timeout" -> {
+                if (current.callId != callId) return
+                finishCall(CallSessionPolicy.endReasonLabel(reason), reason ?: type)
+            }
+        }
+    }
+
+    /** One incoming media frame of a live call. Played, never stored. */
+    private fun handleCallAudioFrame(bytes: ByteArray) {
+        if (!_state.value.call.live) return
+        callAudio.enqueueIncoming(bytes)
+    }
+
+    /**
+     * Opens the microphone to speaker path. Called only once the station
+     * confirmed that both participants are on this cell.
+     */
+    private fun openCallMedia(callId: String) {
+        if (callAudio.isRunning) return
+        callSendSequence = 0
+        callLastSendAt = System.currentTimeMillis()
+        val started = callAudio.start(
+            object : CallAudioEngine.Listener {
+                override fun onMicrophoneFrame(frame: ByteArray, length: Int) {
+                    val active = _state.value.call
+                    if (active.phase != CallPhase.ACTIVE || active.callId != callId) return
+                    val packet = runCatching {
+                        CallProtocol.buildFrame(callId, callSendSequence++, frame, length)
+                    }.getOrNull() ?: return
+                    if (socket.sendBinary(packet)) {
+                        callLastSendAt = System.currentTimeMillis()
+                    }
+                }
+
+                override fun onAudioError(message: String) {
+                    viewModelScope.launch {
+                        finishCall("Appel interrompu : $message", "error")
+                    }
+                }
+            },
+            speaker = _state.value.call.speaker
+        )
+        if (!started) {
+            finishCall("Microphone ou haut-parleur indisponible", "error")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            callDao.find(callId)?.let { row ->
+                callDao.upsert(
+                    row.copy(
+                        state = CallRecordState.ACTIVE,
+                        connectedAt = System.currentTimeMillis()
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * Watches the call from the moment it is placed: it expires an unanswered
+     * invitation, refreshes the displayed duration and detects a media stream
+     * that stopped arriving. One tick per second, no blocking work.
+     */
+    private fun startCallWatchdog() {
+        callJob?.cancel()
+        callJob = viewModelScope.launch {
+            while (isActive) {
+                val call = _state.value.call
+                val now = System.currentTimeMillis()
+                when (call.phase) {
+                    CallPhase.IDLE, CallPhase.ENDED -> return@launch
+
+                    CallPhase.DIALING, CallPhase.RINGING -> {
+                        if (now - call.startedAt > CallProtocol.RING_TIMEOUT_MS + 1_000L) {
+                            finishCall("Pas de réponse", "timeout")
+                            return@launch
+                        }
+                    }
+
+                    CallPhase.ACTIVE -> {
+                        if (!socket.isConnected()) {
+                            finishCall("Appel interrompu : station injoignable", "disconnected")
+                            return@launch
+                        }
+                        val silence = callAudio.silenceMs(now)
+                        if (silence >= 0L && silence > CallProtocol.MEDIA_SILENCE_TIMEOUT_MS) {
+                            val profile = _state.value.profile
+                            val callId = call.callId
+                            if (profile != null && callId != null) {
+                                viewModelScope.launch(Dispatchers.IO) {
+                                    runCatching {
+                                        api.callHangup(
+                                            JSONObject().put("callId", callId)
+                                                .put("userId", profile.userId).toString()
+                                        )
+                                    }
+                                }
+                            }
+                            finishCall("Appel interrompu : flux audio perdu", "timeout")
+                            return@launch
+                        }
+                        val connectedAt = call.connectedAt
+                        if (connectedAt != null) {
+                            _state.update {
+                                it.copy(call = it.call.copy(durationMs = now - connectedAt))
+                            }
+                        }
+                    }
+                }
+                delay(1_000L)
+            }
+        }
+    }
+
+    /**
+     * Closes the call locally: releases the audio path, closes the journal row
+     * and shows the reason. The station has already released its own session (or
+     * does it through its own watchdog), so nothing stays open on either side.
+     */
+    private fun finishCall(message: String, reason: String?) {
+        val call = _state.value.call
+        val callId = call.callId
+        callJob?.cancel()
+        callJob = null
+        if (callAudio.isRunning) {
+            callAudio.stop()
+        }
+        if (callId != null) {
+            viewModelScope.launch(Dispatchers.IO) { closeCallRow(callId, reason, call.phase) }
+        }
+        _state.update {
+            it.copy(
+                call = CallUiState(phase = CallPhase.IDLE, reason = reason, detail = message),
+                info = message
+            )
+        }
+    }
+
+    private suspend fun recordCallStart(
+        callId: String,
+        peerId: String,
+        peerName: String,
+        direction: String
+    ) {
+        if (callId.isBlank()) return
+        callDao.upsert(
+            CallEntity(
+                id = callId,
+                peerId = peerId,
+                peerName = peerName,
+                cell = _state.value.cellSite,
+                direction = direction,
+                state = if (direction == "out") CallRecordState.DIALING else CallRecordState.RINGING,
+                startedAt = System.currentTimeMillis()
+            )
+        )
+    }
+
+    private suspend fun closeCallRow(callId: String, reason: String?, phase: CallPhase) {
+        val row = callDao.find(callId) ?: return
+        val now = System.currentTimeMillis()
+        val duration = row.connectedAt?.let { (now - it).coerceAtLeast(0L) } ?: 0L
+        val state = when {
+            phase == CallPhase.ACTIVE -> CallRecordState.ENDED
+            reason == "rejected" -> CallRecordState.REFUSED
+            reason == "error" -> CallRecordState.FAILED
+            row.direction == "in" -> CallRecordState.MISSED
+            else -> CallRecordState.ENDED
+        }
+        callDao.close(callId, state, reason, now, duration)
+    }
+
+    private fun callRefusalMessage(status: String): String = when (status) {
+        "cross-cell" -> "Appel impossible : le correspondant est sur une autre cellule"
+        "busy" -> "Correspondant déjà en communication"
+        "recipient-offline" -> "Correspondant non connecté à cette cellule"
+        "unknown-user" -> "Destinataire inconnu dans cette cellule"
+        "self-call" -> "Vous ne pouvez pas vous appeler vous-même"
+        "unavailable" -> "Correspondant indisponible"
+        "call-too-soon" -> "Patientez un instant avant de rappeler"
+        "call-table-full" -> "Trop d'appels en cours sur cette cellule"
+        "expired" -> "Invitation expirée"
+        else -> "Appel refusé ($status)"
+    }
+
+    // -----------------------------------------------------------------------
     // Socket dispatch
     // -----------------------------------------------------------------------
     private fun handleSocketText(text: String) {
@@ -1671,6 +2136,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
             "voice_begin", "voice_nack", "voice_done", "voice_played" ->
                 viewModelScope.launch(Dispatchers.IO) { onVoiceControl(json) }
+            // Live call signalling. New events only: the ones above keep their
+            // exact previous meaning.
+            "call_invite", "call_ringing", "call_accepted", "call_rejected",
+            "call_cancelled", "call_ended", "call_timeout" -> handleCallEvent(json)
         }
     }
 
@@ -1723,6 +2192,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         wifi.stopMonitoring()
         wifi.release()
+        // A live call owns the microphone and the speaker: they are released here
+        // even if the activity disappears without hanging up. The station closes
+        // its own session as soon as the socket drops.
+        callJob?.cancel()
+        if (callAudio.isRunning) callAudio.stop()
         socket.disconnect()
         player.stop()
         recorder.cancel()

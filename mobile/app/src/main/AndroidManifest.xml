@@ -21,6 +21,11 @@
         android:usesPermissionFlags="neverForLocation"
         tools:targetApi="33" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--
+        Live calls need MODIFY_AUDIO_SETTINGS to select the audio mode and the
+        loudspeaker / earpiece routing of the call. Normal permission, no prompt.
+    -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <uses-feature
         android:name="android.hardware.microphone"

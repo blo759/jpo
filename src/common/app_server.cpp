@@ -81,8 +81,19 @@ void AppServer::begin() {
   http_.on("/api/messages/receipt", HTTP_POST, [this]() { handleReceipt(); });
   http_.on("/api/voice/block", HTTP_POST, [this]() { handleVoiceBlock(); });
   http_.on("/api/voice/feedback", HTTP_POST, [this]() { handleVoiceFeedback(); });
+  // Real time calls. New routes only: the existing ones are untouched.
+  http_.on("/api/call/invite", HTTP_POST, [this]() { handleCallInvite(); });
+  http_.on("/api/call/accept", HTTP_POST, [this]() { handleCallAccept(); });
+  http_.on("/api/call/reject", HTTP_POST, [this]() { handleCallReject(); });
+  http_.on("/api/call/cancel", HTTP_POST, [this]() { handleCallCancel(); });
+  http_.on("/api/call/hangup", HTTP_POST, [this]() { handleCallHangup(); });
+  http_.on("/api/call/state", HTTP_GET, [this]() { handleCallState(); });
   http_.onNotFound([this]() { handleNotFound(); });
   http_.begin();
+
+  // The call table only trusts this station's own WebSocket bindings, so a user
+  // of another cell can never be invited.
+  calls_.begin(&AppServer::probeLocalUser, this);
 
   ws_.begin();
   ws_.onEvent([this](uint8_t clientNumber, WStype_t type, uint8_t* payload, size_t length) {
@@ -98,6 +109,9 @@ void AppServer::begin() {
 void AppServer::loop() {
   http_.handleClient();
   ws_.loop();
+  // Expires unanswered invitations and calls that stopped carrying media. Bounded
+  // work (one session per call), so the main loop is never blocked.
+  serviceCallTimeouts();
 }
 
 void AppServer::sendJson(int code, const String& body) {
@@ -145,13 +159,35 @@ void AppServer::handleSocketEvent(uint8_t clientNumber,
   }
   ++socketEvents_;
   switch (static_cast<WStype_t>(type)) {
-    case WStype_DISCONNECTED:
+    case WStype_DISCONNECTED: {
+      // A user that leaves the cell can no longer be part of a call: the session
+      // is closed and the other party is notified, so no resource leaks.
+      char leaving[kMaxUserIdLength] = {0};
+      strncpy(leaving, socketUsers_[clientNumber], kMaxUserIdLength - 1U);
       socketUsers_[clientNumber][0] = '\0';
+      if (leaving[0] != '\0') {
+        endCallsForUser(leaving, "call_ended", "disconnected");
+      }
       LOG_I("ws", "socket %u disconnected", static_cast<unsigned>(clientNumber));
       break;
+    }
 
     case WStype_CONNECTED:
       LOG_I("ws", "socket %u connected, waiting for hello", static_cast<unsigned>(clientNumber));
+      break;
+
+    case WStype_BIN:
+      // Binary payloads are either a recorded voice block (0xA5) or a live call
+      // media frame (0xA7). The dispatch is explicit so the two features can
+      // never be confused.
+      if (length > 0U && payload[0] == kVoiceBinaryMagic) {
+        // Recorded voice notes are pushed by the station to the application;
+        // a client never sends one back, so nothing to do here.
+        LOG_D("ws", "binary voice frame from socket %u ignored",
+              static_cast<unsigned>(clientNumber));
+        break;
+      }
+      handleCallAudio(clientNumber, payload, length);
       break;
 
     case WStype_TEXT: {
@@ -374,6 +410,9 @@ void AppServer::handleInfo() {
   doc["uptime"] = mesh_.uptimeSeconds();
   doc["terminated"] = config_.rs485Terminated;
   doc["users"] = mesh_.routing().entries();
+  // Additive: real time calls are local to this cell, so only a local count is
+  // meaningful here.
+  doc["calls"] = calls_.activeSessions();
 
   JsonArray peers = doc["peers"].to<JsonArray>();
   for (uint8_t node = 1; node <= kMaxStationNodes; ++node) {
@@ -435,6 +474,22 @@ void AppServer::handleHealth() {
   JsonObject sockets = doc["sockets"].to<JsonObject>();
   sockets["events"] = socketEvents_;
   sockets["pushed"] = pushedEvents_;
+
+  // Additive block: local real time calls. Existing consumers ignore it, and the
+  // counters make it obvious that call audio is relayed locally and never
+  // submitted to the bus (there is no bus counter here on purpose).
+  JsonObject calls = doc["calls"].to<JsonObject>();
+  calls["active"] = calls_.activeSessions();
+  calls["completed"] = calls_.completedCalls();
+  calls["refused"] = calls_.refusedCalls();
+  calls["lastRefusal"] = calls_.lastRefusal();
+  calls["audioFrames"] = callAudioFrames_;
+  calls["audioRelayed"] = callAudioRelayed_;
+  calls["audioRejected"] = callAudioRejected_;
+  calls["audioSilent"] = callAudioSilent_;
+  calls["transport"] = "websocket-binary";
+  calls["sampleRate"] = 8000;
+  calls["frameMs"] = 40;
 
   String out;
   serializeJson(doc, out);
@@ -505,6 +560,473 @@ void AppServer::handlePresenceLeave() {
   mesh_.removeLocalUser(userId);
   sendStatus(200, "left");
   pushPresence();
+}
+
+// ---------------------------------------------------------------------------
+// Real time calls - signalling
+//
+// Everything below is local to this cell. None of these handlers calls
+// mesh_.submitAppPayload(): a call never enters the RS485 egress queue and is
+// never routed to another station. The media itself is relayed by
+// handleCallAudio() between two WebSocket clients of this same station.
+// ---------------------------------------------------------------------------
+void AppServer::handleCallInvite() {
+  const String body = http_.arg("plain");
+  JsonDocument doc;
+  if (deserializeJson(doc, body.c_str(), body.length())) {
+    sendStatus(400, "invalid-json");
+    return;
+  }
+  const char* callId = doc["callId"] | "";
+  const char* from = doc["from"] | "";
+  const char* to = doc["to"] | "";
+  if (callId[0] == '\0' || from[0] == '\0' || to[0] == '\0') {
+    sendStatus(400, "missing-fields");
+    return;
+  }
+
+  // Explicit cellular check first: when the recipient is known but belongs to
+  // another station, the refusal names the real reason instead of a generic
+  // error. A cross cell call is a normal, expected answer here.
+  const RouteEntry* target = mesh_.routing().find(to);
+  if (target == nullptr) {
+    sendStatus(404, "unknown-user", "the recipient was never seen on this network");
+    return;
+  }
+  if (target->station != config_.nodeId) {
+    sendStatus(409, "cross-cell",
+               "real time calls are restricted to users connected to this cell");
+    return;
+  }
+  if (!target->online) {
+    sendStatus(409, "recipient-offline", "the recipient is not connected to this cell");
+    return;
+  }
+
+  // Authoritative check: both participants must hold a live socket on *this*
+  // station. The declared "cell" of a client is never trusted.
+  const CallStatus status = calls_.invite(callId, from, to, millis());
+  if (status != CallStatus::kOk) {
+    replyCallStatus(status);
+    return;
+  }
+  const CallSession* session = calls_.find(callId);
+  if (session == nullptr) {
+    sendStatus(500, "internal-error");
+    return;
+  }
+  pushCallEvent(session->callee, "call_invite", *session, nullptr, nullptr);
+  pushCallEvent(session->caller, "call_ringing", *session, nullptr, nullptr);
+  LOG_I("call", "%s invites %s (%s) on %s", session->caller, session->callee, session->callId,
+        config_.siteId);
+
+  JsonDocument out;
+  out["status"] = "ringing";
+  out["callId"] = session->callId;
+  out["cell"] = config_.siteId;
+  out["to"] = session->callee;
+  String text;
+  serializeJson(out, text);
+  sendJson(202, text);
+}
+
+void AppServer::handleCallAccept() {
+  const String body = http_.arg("plain");
+  JsonDocument doc;
+  if (deserializeJson(doc, body.c_str(), body.length())) {
+    sendStatus(400, "invalid-json");
+    return;
+  }
+  const char* callId = doc["callId"] | "";
+  const char* userId = doc["userId"] | "";
+  if (callId[0] == '\0' || userId[0] == '\0') {
+    sendStatus(400, "missing-fields");
+    return;
+  }
+  const CallStatus status = calls_.accept(callId, userId, millis());
+  if (status != CallStatus::kOk) {
+    replyCallStatus(status);
+    return;
+  }
+  const CallSession* session = calls_.find(callId);
+  if (session == nullptr) {
+    sendStatus(500, "internal-error");
+    return;
+  }
+  // Both participants open the media channel at the same instant.
+  pushCallEvent(session->caller, "call_accepted", *session, nullptr, nullptr);
+  pushCallEvent(session->callee, "call_accepted", *session, nullptr, nullptr);
+  LOG_I("call", "%s accepted the call of %s (%s)", session->callee, session->caller,
+        session->callId);
+  sendStatus(200, "active");
+}
+
+void AppServer::handleCallReject() {
+  const String body = http_.arg("plain");
+  JsonDocument doc;
+  if (deserializeJson(doc, body.c_str(), body.length())) {
+    sendStatus(400, "invalid-json");
+    return;
+  }
+  const char* callId = doc["callId"] | "";
+  const char* userId = doc["userId"] | "";
+  if (callId[0] == '\0' || userId[0] == '\0') {
+    sendStatus(400, "missing-fields");
+    return;
+  }
+  const CallSession* session = calls_.find(callId);
+  char caller[kCallUserLength] = {0};
+  if (session != nullptr) {
+    strncpy(caller, session->caller, sizeof(caller) - 1U);
+  }
+  const CallStatus status = calls_.reject(callId, userId, millis());
+  if (status != CallStatus::kOk) {
+    replyCallStatus(status);
+    return;
+  }
+  notifyCallEnded(caller, callId, userId, "call_rejected", "rejected");
+  LOG_I("call", "%s rejected the call of %s (%s)", userId, caller, callId);
+  sendStatus(200, "rejected");
+}
+
+void AppServer::handleCallCancel() {
+  const String body = http_.arg("plain");
+  JsonDocument doc;
+  if (deserializeJson(doc, body.c_str(), body.length())) {
+    sendStatus(400, "invalid-json");
+    return;
+  }
+  const char* callId = doc["callId"] | "";
+  const char* userId = doc["userId"] | "";
+  if (callId[0] == '\0' || userId[0] == '\0') {
+    sendStatus(400, "missing-fields");
+    return;
+  }
+  const CallSession* session = calls_.find(callId);
+  char callee[kCallUserLength] = {0};
+  if (session != nullptr) {
+    strncpy(callee, session->callee, sizeof(callee) - 1U);
+  }
+  const CallStatus status = calls_.cancel(callId, userId, millis());
+  if (status != CallStatus::kOk) {
+    replyCallStatus(status);
+    return;
+  }
+  notifyCallEnded(callee, callId, userId, "call_cancelled", "cancelled");
+  LOG_I("call", "%s cancelled the call to %s (%s)", userId, callee, callId);
+  sendStatus(200, "cancelled");
+}
+
+void AppServer::handleCallHangup() {
+  const String body = http_.arg("plain");
+  JsonDocument doc;
+  if (deserializeJson(doc, body.c_str(), body.length())) {
+    sendStatus(400, "invalid-json");
+    return;
+  }
+  const char* callId = doc["callId"] | "";
+  const char* userId = doc["userId"] | "";
+  if (callId[0] == '\0' || userId[0] == '\0') {
+    sendStatus(400, "missing-fields");
+    return;
+  }
+  const CallSession* session = calls_.find(callId);
+  char peer[kCallUserLength] = {0};
+  if (session != nullptr) {
+    const char* other = strcmp(session->caller, userId) == 0 ? session->callee : session->caller;
+    strncpy(peer, other, sizeof(peer) - 1U);
+  }
+  const CallStatus status = calls_.hangup(callId, userId, millis());
+  if (status != CallStatus::kOk) {
+    replyCallStatus(status);
+    return;
+  }
+  notifyCallEnded(peer, callId, userId, "call_ended", "hangup");
+  LOG_I("call", "%s ended the call %s", userId, callId);
+  sendStatus(200, "ended");
+}
+
+// Diagnostic view of the call state of one user on this cell. Read only.
+void AppServer::handleCallState() {
+  const char* userId = http_.arg("userId").c_str();
+  const CallSession* session =
+      (userId != nullptr && userId[0] != '\0') ? calls_.sessionOf(userId) : nullptr;
+  JsonDocument doc;
+  doc["cell"] = config_.siteId;
+  doc["node"] = config_.nodeId;
+  doc["active"] = calls_.activeSessions();
+  doc["completed"] = calls_.completedCalls();
+  doc["refused"] = calls_.refusedCalls();
+  doc["lastRefusal"] = calls_.lastRefusal();
+  doc["audioFrames"] = callAudioFrames_;
+  doc["audioRelayed"] = callAudioRelayed_;
+  doc["audioRejected"] = callAudioRejected_;
+  doc["audioSilent"] = callAudioSilent_;
+  JsonObject media = doc["audio"].to<JsonObject>();
+  media["sampleRate"] = 8000;
+  media["channels"] = 1;
+  media["bitsPerSample"] = 16;
+  media["frameMs"] = 40;
+  media["frameBytes"] = kCallAudioFrameBytes;
+  media["headerBytes"] = kCallAudioHeaderSize;
+  media["transport"] = "websocket-binary";
+  if (session != nullptr) {
+    JsonObject call = doc["call"].to<JsonObject>();
+    call["callId"] = session->callId;
+    call["state"] = callStateName(session->state);
+    call["from"] = session->caller;
+    call["to"] = session->callee;
+    call["role"] = strcmp(session->caller, userId) == 0 ? "caller" : "callee";
+  }
+  String out;
+  serializeJson(doc, out);
+  sendJson(200, out);
+}
+
+// ---------------------------------------------------------------------------
+// Real time calls - media relay
+//
+// This is the whole audio path of a call: a binary WebSocket frame received
+// from one client of this station is forwarded to the peer client of the same
+// station. No RS485 frame, no mesh queue, no HTTP body, no base64.
+// ---------------------------------------------------------------------------
+void AppServer::handleCallAudio(uint8_t clientNumber, uint8_t* payload, size_t length) {
+  ++callAudioFrames_;
+  if (clientNumber >= WEBSOCKETS_SERVER_CLIENT_MAX) {
+    ++callAudioRejected_;
+    return;
+  }
+  const char* sender = socketUsers_[clientNumber];
+  if (sender[0] == '\0') {
+    // A socket that did not announce itself cannot carry media.
+    ++callAudioRejected_;
+    return;
+  }
+  char callId[kCallIdLength + 1] = {0};
+  uint16_t sequence = 0;
+  const uint8_t* media = nullptr;
+  size_t mediaLength = 0;
+  if (!parseCallAudioFrame(payload, length, callId, sizeof(callId), sequence, &media,
+                           mediaLength)) {
+    ++callAudioRejected_;
+    LOG_D("call", "malformed media frame from socket %u (%u bytes)",
+          static_cast<unsigned>(clientNumber), static_cast<unsigned>(length));
+    return;
+  }
+  // Only an established session of this station can relay, and only between its
+  // two participants.
+  const char* peer = calls_.mediaPeer(callId, sender);
+  if (peer == nullptr) {
+    ++callAudioRejected_;
+    return;
+  }
+  size_t delivered = 0;
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; ++i) {
+    if (i == clientNumber || socketUsers_[i][0] == '\0') {
+      continue;
+    }
+    if (strcmp(socketUsers_[i], peer) != 0) {
+      continue;
+    }
+    if (ws_.sendBIN(i, payload, length)) {
+      ++delivered;
+    }
+  }
+  if (delivered == 0U) {
+    // The peer socket vanished: the media watchdog closes the session shortly.
+    ++callAudioSilent_;
+    return;
+  }
+  calls_.noteMedia(callId, millis());
+  callAudioRelayed_ += static_cast<uint32_t>(delivered);
+}
+
+// ---------------------------------------------------------------------------
+// Real time calls - lifecycle helpers
+// ---------------------------------------------------------------------------
+void AppServer::serviceCallTimeouts() {
+  const uint32_t now = millis();
+  char callId[kCallIdLength + 1] = {0};
+  // One expired invitation per call: bounded work, never a blocking loop.
+  while (calls_.expireRinging(now, callId, sizeof(callId))) {
+    LOG_I("call", "invitation %s expired without an answer", callId);
+    broadcastCallEvent("call_timeout", callId, "timeout");
+  }
+  char caller[kCallUserLength] = {0};
+  char callee[kCallUserLength] = {0};
+  while (calls_.expireStaleMedia(now, callId, sizeof(callId), caller, sizeof(caller), callee,
+                                 sizeof(callee))) {
+    LOG_W("call", "call %s dropped: no media for %lu ms", callId,
+          static_cast<unsigned long>(kCallMediaTimeoutMs));
+    notifyCallEnded(caller, callId, callee, "call_ended", "timeout");
+    notifyCallEnded(callee, callId, caller, "call_ended", "timeout");
+  }
+}
+
+void AppServer::notifyCallEnded(const char* userId,
+                                const char* callId,
+                                const char* peer,
+                                const char* event,
+                                const char* reason) {
+  if (userId == nullptr || userId[0] == '\0') {
+    return;
+  }
+  String out;
+  out.reserve(160);
+  out += "{\"type\":\"";
+  out += event;
+  out += "\",\"callId\":\"";
+  appendJsonEscaped(out, callId);
+  out += "\",\"peer\":\"";
+  appendJsonEscaped(out, peer);
+  out += "\",\"cell\":\"";
+  out += config_.siteId;
+  out += "\",\"state\":\"ended\",\"reason\":\"";
+  out += reason;
+  out += "\"}";
+  pushToUser(userId, out);
+}
+
+void AppServer::broadcastCallEvent(const char* event, const char* callId, const char* reason) {
+  String out;
+  out.reserve(160);
+  out += "{\"type\":\"";
+  out += event;
+  out += "\",\"callId\":\"";
+  appendJsonEscaped(out, callId);
+  out += "\",\"cell\":\"";
+  out += config_.siteId;
+  out += "\",\"state\":\"ended\",\"reason\":\"";
+  out += reason;
+  out += "\"}";
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; ++i) {
+    if (socketUsers_[i][0] != '\0') {
+      ws_.sendTXT(i, out.c_str());
+      ++pushedEvents_;
+    }
+  }
+}
+
+// Called when a socket closes: the session of that user is released and the
+// other participant is told, so no audio resource stays open.
+void AppServer::endCallsForUser(const char* userId, const char* event, const char* reason) {
+  char peer[kCallUserLength] = {0};
+  char callId[kCallIdLength + 1] = {0};
+  if (calls_.endForUser(userId, CallEndReason::kDisconnected, millis(), peer, sizeof(peer),
+                        callId, sizeof(callId)) != CallStatus::kOk) {
+    return;
+  }
+  LOG_I("call", "call %s released: %s left the cell", callId, userId);
+  notifyCallEnded(peer, callId, userId, event, reason);
+}
+
+void AppServer::replyCallStatus(CallStatus status) {
+  switch (status) {
+    case CallStatus::kOk:
+      sendStatus(200, "ok");
+      return;
+    case CallStatus::kSelfCall:
+      sendStatus(400, "self-call", "a user cannot call itself");
+      return;
+    case CallStatus::kNotLocal:
+      sendStatus(409, "cross-cell",
+                 "real time calls are restricted to users connected to this cell");
+      return;
+    case CallStatus::kUnknownUser:
+      sendStatus(404, "unknown-user");
+      return;
+    case CallStatus::kUnavailable:
+      sendStatus(409, "unavailable", "the recipient is not reachable on this cell");
+      return;
+    case CallStatus::kBusy:
+      sendStatus(409, "busy", "one of the two users is already in a call");
+      return;
+    case CallStatus::kUnknownCall:
+      sendStatus(404, "unknown-call", "no such call on this cell");
+      return;
+    case CallStatus::kNotParticipant:
+      sendStatus(403, "not-participant", "this user is not part of the call");
+      return;
+    case CallStatus::kInvalidState:
+      sendStatus(409, "invalid-state", "the call is not in a state allowing this action");
+      return;
+    case CallStatus::kExpired:
+      sendStatus(410, "expired", "the invitation expired");
+      return;
+    case CallStatus::kTableFull:
+      sendStatus(503, "call-table-full", "too many calls on this cell, retry later");
+      return;
+    case CallStatus::kTooSoon:
+      sendStatus(429, "call-too-soon", "wait before placing another call");
+      return;
+    case CallStatus::kInvalidCallId:
+      sendStatus(400, "invalid-call-id", "a call id is 8 alphanumeric characters");
+      return;
+  }
+  sendStatus(500, "internal-error");
+}
+
+void AppServer::pushCallEvent(const char* userId,
+                              const char* event,
+                              const CallSession& session,
+                              const char* reason,
+                              const char* extraJson) {
+  if (userId == nullptr || userId[0] == '\0') {
+    return;
+  }
+  String out;
+  out.reserve(256);
+  out += "{\"type\":\"";
+  out += event;
+  out += "\",\"callId\":\"";
+  appendJsonEscaped(out, session.callId);
+  out += "\",\"from\":\"";
+  appendJsonEscaped(out, session.caller);
+  out += "\",\"to\":\"";
+  appendJsonEscaped(out, session.callee);
+  out += "\",\"cell\":\"";
+  out += config_.siteId;
+  out += "\",\"state\":\"";
+  out += callStateName(session.state);
+  out += "\",\"audio\":{\"sampleRate\":8000,\"frameMs\":40,\"frameBytes\":";
+  out += String(static_cast<unsigned>(kCallAudioFrameBytes));
+  out += ",\"headerBytes\":";
+  out += String(static_cast<unsigned>(kCallAudioHeaderSize));
+  out += "}";
+  if (reason != nullptr) {
+    out += ",\"reason\":\"";
+    out += reason;
+    out += '"';
+  }
+  if (extraJson != nullptr) {
+    out += ',';
+    out += extraJson;
+  }
+  out += '}';
+  pushToUser(userId, out);
+}
+
+// ---------------------------------------------------------------------------
+// Real time calls - local membership
+// ---------------------------------------------------------------------------
+bool AppServer::hasLocalSocket(const char* userId) const {
+  if (userId == nullptr || userId[0] == '\0') {
+    return false;
+  }
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; ++i) {
+    if (socketUsers_[i][0] != '\0' && strcmp(socketUsers_[i], userId) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AppServer::probeLocalUser(void* context, const char* userId) {
+  AppServer* server = static_cast<AppServer*>(context);
+  if (server == nullptr) {
+    return false;
+  }
+  return server->hasLocalSocket(userId);
 }
 
 void AppServer::handleNotFound() {

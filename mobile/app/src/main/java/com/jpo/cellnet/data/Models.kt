@@ -120,13 +120,19 @@ interface ChatDao {
 }
 
 @Database(
-    entities = [ConversationEntity::class, MessageEntity::class, TransferEntity::class],
-    version = 2,
+    entities = [
+        ConversationEntity::class,
+        MessageEntity::class,
+        TransferEntity::class,
+        CallEntity::class
+    ],
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun chatDao(): ChatDao
     abstract fun transferDao(): TransferDao
+    abstract fun callDao(): CallDao
 
     companion object {
         @Volatile
@@ -157,13 +163,38 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Adds the live call journal. Purely additive: no existing table is
+         * altered and no user data is removed, so an upgrade keeps every
+         * conversation, every message, every transfer and the identity.
+         */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `calls` (" +
+                        "`id` TEXT NOT NULL, " +
+                        "`peerId` TEXT NOT NULL, " +
+                        "`peerName` TEXT NOT NULL, " +
+                        "`cell` TEXT, " +
+                        "`direction` TEXT NOT NULL, " +
+                        "`state` TEXT NOT NULL, " +
+                        "`startedAt` INTEGER NOT NULL, " +
+                        "`connectedAt` INTEGER, " +
+                        "`endedAt` INTEGER, " +
+                        "`durationMs` INTEGER NOT NULL, " +
+                        "`reason` TEXT, " +
+                        "PRIMARY KEY(`id`))"
+                )
+            }
+        }
+
         fun get(context: Context): AppDatabase =
             instance ?: synchronized(this) {
                 instance ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
                     "cellnet.db"
-                ).addMigrations(MIGRATION_1_2)
+                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                     .also { instance = it }
             }
