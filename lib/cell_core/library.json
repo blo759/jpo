@@ -1,0 +1,12 @@
+{
+  "name": "cell_core",
+  "version": "1.0.0",
+  "keywords": ["rs485", "esp32", "routing", "bus"],
+  "description": "Transport core for the local cellular prototype: egress queue, RS485 token arbitration, presence/routing table",
+  "license": "MIT",
+  "platforms": ["espressif32", "native"],
+  "frameworks": "*",
+  "build": {
+    "srcFilter": "+<*>"
+  }
+}

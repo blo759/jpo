@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CellNet</string>
+    <string name="setup_title">Bienvenue sur CellNet</string>
+    <string name="setup_subtitle">Réseau local à trois cellules, sans Internet.</string>
+    <string name="setup_name_label">Votre nom d\'affichage</string>
+    <string name="setup_action">Créer mon identité</string>
+    <string name="setup_hint">Un identifiant stable est généré sur ce téléphone. Le nom d\'affichage n\'est pas une preuve d\'identité.</string>
+</resources>

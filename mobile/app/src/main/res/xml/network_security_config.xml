@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The stations expose a local HTTP/WS service on the ESP32 access point
+         (no TLS available on a 3 x ESP32 prototype). Cleartext is therefore
+         allowed, and only usable inside the local Wi-Fi cells. -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

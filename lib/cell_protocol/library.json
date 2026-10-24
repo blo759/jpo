@@ -1,0 +1,9 @@
+{
+  "name": "cell_protocol",
+  "version": "1.1.0",
+  "keywords": ["rs485", "esp32", "protocol", "cobs"],
+  "description": "COBS framed, CRC16 protected transport protocol shared by the three stations and the native unit tests",
+  "license": "MIT",
+  "platforms": ["espressif32", "native"],
+  "frameworks": "*"
+}
